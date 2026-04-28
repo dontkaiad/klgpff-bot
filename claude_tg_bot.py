@@ -273,7 +273,9 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     prompt = load_prompt(update.effective_chat.id)
-    await update.message.reply_text(f"system prompt:\n\n{prompt}")
+    text = f"system prompt:\n\n{prompt}"
+    for chunk in split_by_paragraphs(text):
+        await update.message.reply_text(chunk)
 
 
 async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
