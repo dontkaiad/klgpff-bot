@@ -39,7 +39,7 @@ def load_dotenv():
 load_dotenv()
 
 import anthropic
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -157,24 +157,47 @@ def trim_history(history: list[dict]) -> list[dict]:
 
 
 # --- Хэндлеры ---
+HELP_TEXT = (
+    "📝 диалог:\n"
+    "/new — новый диалог (сбросить контекст)\n\n"
+    "🧠 память (сохраняется между сессиями):\n"
+    "/remember <факт> — запомнить\n"
+    "/forget <номер> — забыть по номеру\n"
+    "/forget all — забыть всё\n"
+    "/facts — все факты\n\n"
+    "⚙️ настройки:\n"
+    "/system — текущий system prompt\n"
+    "/setsystem <текст> — задать новый (заменяет)\n"
+    "/addprompt <текст> — добавить к существующему\n\n"
+    "ℹ️ /help — это сообщение"
+)
+
+BOT_COMMANDS = [
+    ("new", "новый диалог (сбросить контекст)"),
+    ("remember", "запомнить факт о персонаже"),
+    ("forget", "забыть факт по номеру или всё (/forget all)"),
+    ("facts", "показать все факты"),
+    ("system", "текущий system prompt"),
+    ("setsystem", "задать новый system prompt"),
+    ("addprompt", "добавить к существующему промпту"),
+    ("help", "список команд"),
+]
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("нет доступа.")
         return
     await update.message.reply_text(
-        "привет. пиши что угодно — я отвечу через Anthropic API.\n\n"
-        "📝 диалог:\n"
-        "/new — новый диалог (сбросить контекст)\n\n"
-        "🧠 память (сохраняется между сессиями):\n"
-        "/remember <факт> — запомнить\n"
-        "/forget <номер> — забыть по номеру\n"
-        "/forget all — забыть всё\n"
-        "/facts — все факты\n\n"
-        "⚙️ настройки:\n"
-        "/system — текущий system prompt\n"
-        "/setsystem <текст> — задать новый (заменяет)\n"
-        "/addprompt <текст> — добавить к существующему"
+        "привет. пиши что угодно — я отвечу через Anthropic API.\n\n" + HELP_TEXT
     )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("нет доступа.")
+        return
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,10 +369,20 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
     return chunks
 
 
+async def register_commands(app: Application):
+    await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(register_commands)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("forget", cmd_forget))
