@@ -6,6 +6,8 @@
 # Bot data
 facts/
 prompts/
+models/
+usage/
 *.json
 *.pkl
 
