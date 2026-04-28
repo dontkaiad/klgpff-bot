@@ -8,6 +8,7 @@ facts/
 prompts/
 models/
 usage/
+outputs/
 *.json
 *.pkl
 

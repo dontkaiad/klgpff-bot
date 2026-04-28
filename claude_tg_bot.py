@@ -11,6 +11,7 @@ Telegram-бот для creative writing через Anthropic API.
 import json
 import os
 import logging
+from datetime import datetime
 from pathlib import Path
 
 
@@ -85,8 +86,11 @@ FACTS_DIR = BASE_DIR / "facts"
 PROMPTS_DIR = BASE_DIR / "prompts"
 MODELS_DIR = BASE_DIR / "models"
 USAGE_DIR = BASE_DIR / "usage"
-for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR):
+OUTPUTS_DIR = BASE_DIR / "outputs"
+for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR, OUTPUTS_DIR):
     d.mkdir(exist_ok=True)
+
+LONG_REPLY_THRESHOLD = 1500
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
@@ -293,8 +297,10 @@ def system_block(text: str) -> list[dict]:
 HELP_TEXT = (
     "📝 диалог:\n"
     "/new — новый диалог (сбросить контекст)\n"
+    "/scene <описание> — длинная сцена через opus (1500+ слов, файл)\n"
     "/regenerate [правка] — перегенерить последний ответ (с опц. правкой)\n"
-    "/summarize — сжать историю через haiku, чтобы экономить токены\n\n"
+    "/summarize — сжать историю через haiku, чтобы экономить токены\n"
+    "/last — последний сохранённый файл\n\n"
     "🧠 память (сохраняется между сессиями):\n"
     "/remember <факт> — запомнить\n"
     "/forget <номер> — забыть по номеру\n"
@@ -313,8 +319,10 @@ HELP_TEXT = (
 
 BOT_COMMANDS = [
     ("new", "новый диалог (сбросить контекст)"),
+    ("scene", "длинная сцена через opus (1500+ слов, файл)"),
     ("regenerate", "перегенерить последний ответ (можно с правкой)"),
     ("summarize", "сжать историю через haiku"),
+    ("last", "последний сохранённый файл"),
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
     ("facts", "показать все факты"),
@@ -511,6 +519,49 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _generate_and_reply(update, chat_id, user_id, history)
 
 
+async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    chat_dir = OUTPUTS_DIR / str(chat_id)
+    files = sorted(chat_dir.glob("*.txt")) if chat_dir.exists() else []
+    if not files:
+        await update.message.reply_text("сохранённых файлов нет.")
+        return
+    last = files[-1]
+    with last.open("rb") as f:
+        await update.message.reply_document(document=f, filename=last.name)
+
+
+async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    desc = update.message.text.partition(" ")[2].strip()
+    if not desc:
+        await update.message.reply_text(
+            "напиши описание после /scene\n"
+            "пример: /scene первая встреча героев в портовом городе"
+        )
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    wrapped = (
+        "Напиши длинную атмосферную сцену. Используй все факты о персонажах. "
+        f"Минимум 1500 слов. Описание сцены: {desc}"
+    )
+    history = get_history(chat_id)
+    history.append({"role": "user", "content": wrapped})
+    history = trim_history(history)
+    conversations[chat_id] = history
+
+    logger.info(
+        f"[chat {chat_id}] [scene → opus] ({MODELS['opus']}) | desc: {desc[:60]!r}"
+    )
+    await _generate_and_reply(
+        update, chat_id, user_id, history, model_override=MODELS["opus"]
+    )
+
+
 async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -558,6 +609,15 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+def save_output(chat_id: int, text: str) -> Path:
+    chat_dir = OUTPUTS_DIR / str(chat_id)
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = chat_dir / f"{ts}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
     base_prompt = load_prompt(chat_id)
     facts = load_facts(user_id)
@@ -580,6 +640,13 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
 
         for chunk in split_by_paragraphs(assistant_text):
             await update.message.reply_text(chunk)
+
+        if len(assistant_text) > LONG_REPLY_THRESHOLD:
+            path = save_output(chat_id, assistant_text)
+            with path.open("rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=path.name
+                )
     except anthropic.APIError as e:
         logger.error(f"Anthropic API error: {e}")
         await update.message.reply_text(f"ошибка API: {e.message}")
@@ -704,6 +771,8 @@ def main():
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("regenerate", cmd_regenerate))
     app.add_handler(CommandHandler("summarize", cmd_summarize))
+    app.add_handler(CommandHandler("scene", cmd_scene))
+    app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("бот запущен")
