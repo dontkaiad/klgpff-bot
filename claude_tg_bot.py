@@ -155,20 +155,32 @@ def model_path(chat_id: int) -> Path:
     return MODELS_DIR / f"{chat_id}.txt"
 
 
-def load_model(chat_id: int) -> str:
+VALID_MODES = ("auto", "opus", "sonnet", "haiku")
+
+
+def load_mode(chat_id: int) -> str:
+    """Returns one of VALID_MODES. Default 'auto'."""
     path = model_path(chat_id)
     if path.exists():
         try:
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return MODELS.get(value, value)
+            v = path.read_text(encoding="utf-8").strip().lower()
+            if v in VALID_MODES:
+                return v
         except Exception:
             pass
-    return DEFAULT_MODEL
+    return "auto"
 
 
-def save_model(chat_id: int, model: str):
-    model_path(chat_id).write_text(model, encoding="utf-8")
+def save_mode(chat_id: int, mode: str):
+    model_path(chat_id).write_text(mode, encoding="utf-8")
+
+
+def load_model(chat_id: int) -> str:
+    """Resolve mode → concrete model id. 'auto' falls back to DEFAULT_MODEL."""
+    mode = load_mode(chat_id)
+    if mode == "auto":
+        return DEFAULT_MODEL
+    return MODELS[mode]
 
 
 def model_label(model_id: str) -> str:
@@ -292,8 +304,9 @@ HELP_TEXT = (
     "/system — текущий system prompt\n"
     "/setsystem <текст> — задать новый (заменяет)\n"
     "/addprompt <текст> — добавить к существующему\n"
-    "/model — текущая модель\n"
-    "/model opus|sonnet|haiku — переключить модель в этом чате\n\n"
+    "/model — текущий режим\n"
+    "/model auto — классификатор решает (дефолт)\n"
+    "/model opus|sonnet|haiku — всегда эта модель, классификатор off\n\n"
     "💸 /cost — расходы по этому чату\n"
     "ℹ️ /help — это сообщение"
 )
@@ -308,7 +321,7 @@ BOT_COMMANDS = [
     ("system", "текущий system prompt"),
     ("setsystem", "задать новый system prompt"),
     ("addprompt", "добавить к существующему промпту"),
-    ("model", "переключить модель (opus/sonnet/haiku)"),
+    ("model", "режим модели (auto/opus/sonnet/haiku)"),
     ("cost", "расходы по этому чату"),
     ("help", "список команд"),
 ]
@@ -440,21 +453,28 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     arg = update.message.text.partition(" ")[2].strip().lower()
     if not arg:
-        current = load_model(chat_id)
-        aliases = ", ".join(f"{a} → {m}" for a, m in MODELS.items())
+        mode = load_mode(chat_id)
+        if mode == "auto":
+            body = "режим: auto — классификатор решает"
+        else:
+            body = f"режим: {mode} ({MODELS[mode]}) — всегда эта модель"
         await update.message.reply_text(
-            f"сейчас: {model_label(current)}\n\n"
-            f"переключить: /model <alias>\n"
-            f"доступно: {aliases}"
+            f"{body}\n\n"
+            "переключить: /model <auto|opus|sonnet|haiku>"
         )
         return
-    if arg not in MODELS:
+    if arg not in VALID_MODES:
         await update.message.reply_text(
-            f"неизвестный алиас. доступно: {', '.join(MODELS)}"
+            f"доступно: {', '.join(VALID_MODES)}"
         )
         return
-    save_model(chat_id, arg)
-    await update.message.reply_text(f"✓ модель: {model_label(MODELS[arg])}")
+    save_mode(chat_id, arg)
+    if arg == "auto":
+        await update.message.reply_text("✓ режим: auto (классификатор)")
+    else:
+        await update.message.reply_text(
+            f"✓ режим: {arg} ({MODELS[arg]}) — классификатор пропускается"
+        )
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,10 +639,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = trim_history(history)
     conversations[chat_id] = history
 
-    alias = classify_message(chat_id, user_text)
+    mode = load_mode(chat_id)
+    if mode == "auto":
+        alias = classify_message(chat_id, user_text)
+        source = "router"
+    else:
+        alias = mode
+        source = "manual"
     model_id = MODELS[alias]
     logger.info(
-        f"[chat {chat_id}] router → {alias} ({model_id}) | msg: {user_text[:60]!r}"
+        f"[chat {chat_id}] [{source} → {alias}] ({model_id}) | msg: {user_text[:60]!r}"
     )
 
     await _generate_and_reply(
