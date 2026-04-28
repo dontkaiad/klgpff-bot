@@ -49,15 +49,16 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8000"))
 # Алиасы для /model. Все ID — реальные Anthropic API model IDs.
 MODELS = {
     "opus": "claude-opus-4-20250514",
-    "sonnet": "claude-sonnet-4-5",
+    "sonnet": "claude-sonnet-4-20250514",
     "haiku": "claude-haiku-4-5-20251001",
 }
 SUMMARY_MODEL = MODELS["haiku"]
+CLASSIFIER_MODEL = MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
 PRICING = {
     "claude-opus-4-20250514": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
-    "claude-sonnet-4-5": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
+    "claude-sonnet-4-20250514": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
     "claude-haiku-4-5-20251001": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
 }
 
@@ -537,11 +538,11 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
-async def _generate_and_reply(update, chat_id, user_id, history):
+async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
     base_prompt = load_prompt(chat_id)
     facts = load_facts(user_id)
     system_prompt = build_system_prompt(base_prompt, facts)
-    model = load_model(chat_id)
+    model = model_override or load_model(chat_id)
 
     await update.effective_chat.send_action("typing")
 
@@ -567,6 +568,42 @@ async def _generate_and_reply(update, chat_id, user_id, history):
         await update.message.reply_text(f"ошибка: {str(e)}")
 
 
+CLASSIFIER_PROMPT = (
+    "You are a router for a creative-writing chat bot. The user writes in Russian "
+    "or English. Classify the user's message and reply with EXACTLY ONE word: "
+    "opus, sonnet, or haiku. No quotes, no punctuation, no explanation.\n\n"
+    "Rules:\n"
+    "- opus — request to WRITE A NEW scene/fanfic from scratch.\n"
+    "  RU triggers: «напиши», «придумай», «создай сцену», «сочини», «напиши сцену».\n"
+    "  EN triggers: \"write\", \"create\", \"make a scene\", \"come up with\".\n"
+    "- sonnet — continue / rewrite / extend / edit existing text.\n"
+    "  RU triggers: «продолжи», «перепиши», «допиши», «измени», «отредактируй».\n"
+    "  EN triggers: \"continue\", \"rewrite\", \"extend\", \"edit\", \"change\".\n"
+    "- haiku — everything else: discussion, questions, short replies, meta-talk "
+    "about characters, planning, clarifications.\n\n"
+    "Output: opus | sonnet | haiku"
+)
+
+
+def classify_message(chat_id: int, user_text: str) -> str:
+    """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'haiku' on any error."""
+    try:
+        response = client.messages.create(
+            model=CLASSIFIER_MODEL,
+            max_tokens=4,
+            system=CLASSIFIER_PROMPT,
+            messages=[{"role": "user", "content": user_text}],
+        )
+        add_usage(chat_id, CLASSIFIER_MODEL, response.usage)
+        result = response.content[0].text.strip().lower()
+        for alias in ("opus", "sonnet", "haiku"):
+            if alias in result:
+                return alias
+    except Exception as e:
+        logger.warning(f"classify_message fallback to haiku: {e}")
+    return "haiku"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -582,7 +619,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = trim_history(history)
     conversations[chat_id] = history
 
-    await _generate_and_reply(update, chat_id, user_id, history)
+    alias = classify_message(chat_id, user_text)
+    model_id = MODELS[alias]
+    logger.info(
+        f"[chat {chat_id}] router → {alias} ({model_id}) | msg: {user_text[:60]!r}"
+    )
+
+    await _generate_and_reply(
+        update, chat_id, user_id, history, model_override=model_id
+    )
 
 
 def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
