@@ -280,7 +280,7 @@ def system_block(text: str) -> list[dict]:
 HELP_TEXT = (
     "📝 диалог:\n"
     "/new — новый диалог (сбросить контекст)\n"
-    "/regenerate — перегенерить последний ответ\n"
+    "/regenerate [правка] — перегенерить последний ответ (с опц. правкой)\n"
     "/summarize — сжать историю через haiku, чтобы экономить токены\n\n"
     "🧠 память (сохраняется между сессиями):\n"
     "/remember <факт> — запомнить\n"
@@ -299,7 +299,7 @@ HELP_TEXT = (
 
 BOT_COMMANDS = [
     ("new", "новый диалог (сбросить контекст)"),
-    ("regenerate", "перегенерить последний ответ"),
+    ("regenerate", "перегенерить последний ответ (можно с правкой)"),
     ("summarize", "сжать историю через haiku"),
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
@@ -469,6 +469,7 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    note = update.message.text.partition(" ")[2].strip()
     history = get_history(chat_id)
     if not history or history[-1]["role"] != "assistant":
         await update.message.reply_text(
@@ -481,6 +482,10 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "история пуста или последний ход не пользователя."
         )
         return
+    if note:
+        history[-1]["content"] = (
+            f"{history[-1]['content']}\n\n[правка: {note}]"
+        )
     conversations[chat_id] = history
     await _generate_and_reply(update, chat_id, user_id, history)
 
