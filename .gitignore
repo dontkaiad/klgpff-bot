@@ -6,6 +6,7 @@
 # Bot data
 facts/
 *.json
+*.pkl
 
 # Python
 __pycache__/

@@ -44,6 +44,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -324,7 +325,13 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath=Path(__file__).parent / "bot_state.pkl")
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .persistence(persistence)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
