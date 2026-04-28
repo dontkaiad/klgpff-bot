@@ -44,7 +44,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -76,6 +75,9 @@ SYSTEM_PROMPT = os.environ.get(
 FACTS_DIR = Path(__file__).parent / "facts"
 FACTS_DIR.mkdir(exist_ok=True)
 
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+PROMPTS_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
 )
@@ -105,6 +107,24 @@ def save_facts(user_id: int, facts: list[str]):
     facts_path(user_id).write_text(
         json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def prompt_path(chat_id: int) -> Path:
+    return PROMPTS_DIR / f"{chat_id}.txt"
+
+
+def load_prompt(chat_id: int) -> str:
+    path = prompt_path(chat_id)
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return SYSTEM_PROMPT
+
+
+def save_prompt(chat_id: int, prompt: str):
+    prompt_path(chat_id).write_text(prompt, encoding="utf-8")
 
 
 def build_system_prompt(base_prompt: str, facts: list[str]) -> str:
@@ -229,7 +249,7 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    prompt = context.chat_data.get("system_prompt", SYSTEM_PROMPT)
+    prompt = load_prompt(update.effective_chat.id)
     await update.message.reply_text(f"system prompt:\n\n{prompt}")
 
 
@@ -240,8 +260,9 @@ async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("напиши текст после /addprompt")
         return
-    current = context.chat_data.get("system_prompt", SYSTEM_PROMPT)
-    context.chat_data["system_prompt"] = current + "\n\n" + text
+    chat_id = update.effective_chat.id
+    current = load_prompt(chat_id)
+    save_prompt(chat_id, current + "\n\n" + text)
     await update.message.reply_text("✓ добавлено к промпту.")
 
 
@@ -252,8 +273,9 @@ async def cmd_setsystem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("напиши промпт после /setsystem")
         return
-    context.chat_data["system_prompt"] = text
-    conversations[update.effective_chat.id] = []
+    chat_id = update.effective_chat.id
+    save_prompt(chat_id, text)
+    conversations[chat_id] = []
     await update.message.reply_text("system prompt обновлён, контекст сброшен.")
 
 
@@ -272,7 +294,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = trim_history(history)
     conversations[chat_id] = history
 
-    base_prompt = context.chat_data.get("system_prompt", SYSTEM_PROMPT)
+    base_prompt = load_prompt(chat_id)
     facts = load_facts(user_id)
     system_prompt = build_system_prompt(base_prompt, facts)
 
@@ -325,13 +347,7 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
 
 
 def main():
-    persistence = PicklePersistence(filepath=Path(__file__).parent / "bot_state.pkl")
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .persistence(persistence)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
