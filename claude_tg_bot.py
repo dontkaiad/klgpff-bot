@@ -45,7 +45,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-20250514")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "25"))
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8000"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 
 # Алиасы для /model. Все ID — реальные Anthropic API model IDs.
 MODELS = {
@@ -691,6 +691,30 @@ def classify_message(chat_id: int, user_text: str) -> str:
     return "haiku"
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+
+    doc = update.message.document
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"):
+        return
+
+    try:
+        file = await doc.get_file()
+        file_bytes = await file.download_as_bytearray()
+        user_text = file_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.error(f"document read error: {e}")
+        await update.message.reply_text(f"не смогла прочитать файл: {e}")
+        return
+
+    caption = update.message.caption or ""
+    if caption:
+        user_text = f"{caption}\n\n{user_text}"
+
+    await _process_user_text(update, user_text)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -699,6 +723,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+    await _process_user_text(update, user_text)
+
+
+async def _process_user_text(update: Update, user_text: str):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     history = get_history(chat_id)
@@ -773,6 +801,7 @@ def main():
     app.add_handler(CommandHandler("summarize", cmd_summarize))
     app.add_handler(CommandHandler("scene", cmd_scene))
     app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("бот запущен")
