@@ -109,12 +109,13 @@ def facts_path(user_id: int) -> Path:
 
 def load_facts(user_id: int) -> list[str]:
     path = facts_path(user_id)
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception):
-            return []
-    return []
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"failed to load facts for user {user_id} from {path}: {e}")
+        return []
 
 
 def save_facts(user_id: int, facts: list[str]):
@@ -130,12 +131,13 @@ def prompt_path(chat_id: int) -> Path:
 
 def load_prompt(chat_id: int) -> str:
     path = prompt_path(chat_id)
-    if path.exists():
-        try:
-            return path.read_text(encoding="utf-8")
-        except Exception:
-            pass
-    return SYSTEM_PROMPT
+    if not path.exists():
+        return SYSTEM_PROMPT
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.error(f"failed to load prompt for chat {chat_id} from {path}: {e}")
+        return SYSTEM_PROMPT
 
 
 def save_prompt(chat_id: int, prompt: str):
@@ -148,9 +150,13 @@ def build_system_prompt(base_prompt: str, facts: list[str]) -> str:
     facts_block = "\n".join(f"- {f}" for f in facts)
     return (
         f"{base_prompt}\n\n"
-        f"## Факты о персонажах и мире, которые нужно учитывать:\n"
+        f"## Канон персонажей и мира (обязателен к соблюдению)\n"
+        f"Все пункты ниже — установленный канон. Любая написанная сцена должна "
+        f"соответствовать им: ни один факт не должен быть нарушен, а все "
+        f"релевантные сцене факты должны быть отражены в повествовании.\n\n"
         f"{facts_block}\n\n"
-        f"Используй эти факты естественно, не перечисляй их и не ссылайся на них явно."
+        f"Вплетай эти детали в текст естественно — не выводи их списком и не "
+        f"называй внутри сцены «фактами» или «каноном»."
     )
 
 
@@ -278,7 +284,10 @@ def get_history(chat_id: int) -> list[dict]:
 def trim_history(history: list[dict]) -> list[dict]:
     max_messages = MAX_HISTORY * 2
     if len(history) > max_messages:
-        return history[-max_messages:]
+        history = history[-max_messages:]
+    # Anthropic API requires the first message to be from the user.
+    while history and history[0]["role"] != "user":
+        history = history[1:]
     return history
 
 
@@ -623,6 +632,11 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     facts = load_facts(user_id)
     system_prompt = build_system_prompt(base_prompt, facts)
     model = model_override or load_model(chat_id)
+
+    logger.info(
+        f"[chat {chat_id}] [{model}] sending system={len(system_prompt)} chars "
+        f"(base_prompt={len(base_prompt)}, facts={len(facts)}), history={len(history)} msgs"
+    )
 
     await update.effective_chat.send_action("typing")
 
