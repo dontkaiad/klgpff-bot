@@ -11,20 +11,16 @@ reasoning. Why this shape, what I rejected, and what each choice cost me.
 
 ## What this is
 
-I'll be honest about scale first, because it's the context that explains every
-decision below.
-
-There's one user — me. That's not a disclaimer I'm embarrassed about; it's the
-operating condition I designed for, and it's a fact about *now*, not a ceiling.
-A single-user creative-writing tool is a near-perfect proving ground for the part
-of the stack I actually care about: LLM engineering. Model routing, retrieval,
-resilient API plumbing, cost discipline — those problems are real at one user and
-identical in shape at a thousand. The headcount is small; the engineering bar isn't.
+This is a small, focused system, and that focus is the context for every decision
+below. It's a creative-writing tool, but it's also a deliberate proving ground for the
+part of the stack I actually care about: LLM engineering. Model routing, retrieval,
+resilient API plumbing, cost discipline — those are the problems I wanted to practice,
+and they show up here in the same shape they take at scale.
 
 So I held the bar where it'd be on a team. Dockerized, auto-deployed, persistence
-that survives restarts, graceful degradation when a dependency is down. Not because
-one user demands it — because the discipline is the point, and discipline you only
-practice under load is discipline you don't have.
+that survives restarts, graceful degradation when a dependency is down. The footprint
+is small; the discipline isn't — and discipline you only practice under load is
+discipline you don't have.
 
 ## Decisions I'm proud of
 
@@ -104,12 +100,12 @@ survive restarts. The total volume is tiny.
 state, text for prompts and outputs. Legible, greppable, debuggable by `cat`.
 
 **Alternatives rejected.** A real database. It buys concurrent writes, query power, and
-migrations — none of which a single-user tool with kilobytes of state needs. It'd be
-infrastructure carried for a scale I don't have.
+migrations — none of which a tool with kilobytes of serially-written state needs. It'd
+be infrastructure carried for a scale this doesn't have.
 
-**Trade-off.** No concurrent-write safety and no rich queries. Honest cost, and the
-honest answer is that one user writing serially never hits it. The day a second writer
-shows up, this is the first decision I revisit — and I'll know exactly why.
+**Trade-off.** No concurrent-write safety and no rich queries. Honest cost, and at this
+volume the writes are serial and never contend. The day that changes, this is the first
+decision I revisit — and I'll know exactly why.
 
 *A database you don't need is just latency with a schema.*
 
