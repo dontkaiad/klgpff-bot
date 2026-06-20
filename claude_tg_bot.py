@@ -49,20 +49,23 @@ DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "25"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 
-# Алиасы для /model. Все ID — реальные Anthropic API model IDs.
+# Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
+# менять версию модели без правки кода.
 MODELS = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5",
+    "opus": os.environ.get("MODEL_OPUS", "claude-opus-4-8"),
+    "sonnet": os.environ.get("MODEL_SONNET", "claude-sonnet-4-6"),
+    "haiku": os.environ.get("MODEL_HAIKU", "claude-haiku-4-5"),
 }
 SUMMARY_MODEL = MODELS["haiku"]
 CLASSIFIER_MODEL = MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
+# Ключи — алиасы (opus/sonnet/haiku), а не ID: при смене версии в .env
+# цены не отвалятся.
 PRICING = {
-    "claude-opus-4-8": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
-    "claude-sonnet-4-6": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
-    "claude-haiku-4-5": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
+    "opus": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
+    "sonnet": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
+    "haiku": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
 }
 
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")
@@ -222,11 +225,17 @@ def load_model(chat_id: int) -> str:
     return MODELS[mode]
 
 
-def model_label(model_id: str) -> str:
+def model_alias(model_id: str) -> str:
+    """Reverse MODELS: concrete id → alias (opus/sonnet/haiku). '' if unknown."""
     for alias, full in MODELS.items():
         if full == model_id:
-            return f"{alias} ({full})"
-    return model_id
+            return alias
+    return ""
+
+
+def model_label(model_id: str) -> str:
+    alias = model_alias(model_id)
+    return f"{alias} ({model_id})" if alias else model_id
 
 
 # --- Учёт расходов ---
@@ -267,7 +276,8 @@ def add_usage(chat_id: int, model: str, response_usage):
 
 
 def cost_for_model(model: str, b: dict) -> float:
-    p = PRICING.get(model)
+    # usage пишется по model_id; цены — по алиасу, поэтому маппим id → alias.
+    p = PRICING.get(model_alias(model))
     if not p:
         return 0.0
     return (
