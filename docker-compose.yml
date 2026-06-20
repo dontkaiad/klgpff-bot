@@ -11,6 +11,14 @@ services:
       - ./models:/app/models
       - ./outputs:/app/outputs
       - ./backups:/app/backups
+    # $$ — экранирование для Compose: в раннер уходит литеральный $, healthcheck
+    # сравнивает свежесть /tmp/heartbeat (now - mtimestamp < 90с).
+    healthcheck:
+      test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(cat /tmp/heartbeat) )) -lt 90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
   qdrant:
     image: qdrant/qdrant:latest
