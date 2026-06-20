@@ -48,7 +48,7 @@ pip install python-telegram-bot anthropic
 TELEGRAM_BOT_TOKEN=токен_от_botfather
 ANTHROPIC_API_KEY=sk-ant-...
 ALLOWED_USERS=твой_telegram_id
-CLAUDE_MODEL=claude-opus-4-20250514     # дефолт когда режим auto
+CLAUDE_MODEL=claude-opus-4-8     # дефолт когда режим auto
 MAX_HISTORY=25                           # сколько ходов держать в контексте
 MAX_TOKENS=8000                          # max_tokens для генерации
 ```
@@ -133,7 +133,7 @@ Create `.env` next to the script:
 TELEGRAM_BOT_TOKEN=your_botfather_token
 ANTHROPIC_API_KEY=sk-ant-...
 ALLOWED_USERS=your_telegram_id
-CLAUDE_MODEL=claude-opus-4-20250514     # default when mode is auto
+CLAUDE_MODEL=claude-opus-4-8     # default when mode is auto
 MAX_HISTORY=25                           # turns kept in context
 MAX_TOKENS=8000                          # max_tokens for generation
 ```

@@ -45,24 +45,24 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")  # для RAG (rag.py)
-DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-20250514")
+DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "25"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 
 # Алиасы для /model. Все ID — реальные Anthropic API model IDs.
 MODELS = {
-    "opus": "claude-opus-4-20250514",
-    "sonnet": "claude-sonnet-4-20250514",
-    "haiku": "claude-haiku-4-5-20251001",
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
 }
 SUMMARY_MODEL = MODELS["haiku"]
 CLASSIFIER_MODEL = MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
 PRICING = {
-    "claude-opus-4-20250514": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
-    "claude-sonnet-4-20250514": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
-    "claude-haiku-4-5-20251001": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
+    "claude-opus-4-8": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
+    "claude-sonnet-4-6": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
+    "claude-haiku-4-5": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
 }
 
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")

@@ -115,10 +115,10 @@ def search_facts(user_id: int, query: str, top_k: int = 10) -> list:
     """Возвращает релевантные query факты юзера (по убыванию схожести)."""
     qc, _ = _ensure_clients()
     qvec = _embed([query], "query")[0]
-    hits = qc.search(
+    response = qc.query_points(
         collection_name=COLLECTION,
-        query_vector=qvec,
+        query=qvec,
         query_filter=_user_filter(user_id),
         limit=top_k,
     )
-    return [h.payload["fact_text"] for h in hits if h.payload]
+    return [p.payload["fact_text"] for p in response.points if p.payload]

@@ -18,15 +18,15 @@ The bot is single-process, single-event-loop, polling-based. State is on disk; n
 
 ## Three-tier model router
 
-Before each user-initiated turn, `classify_message(chat_id, user_text)` calls `claude-haiku-4-5-20251001` with `max_tokens=4` and a bilingual (RU+EN) system prompt that constrains the response to a single token: `opus`, `sonnet`, or `haiku`.
+Before each user-initiated turn, `classify_message(chat_id, user_text)` calls `claude-haiku-4-5` with `max_tokens=4` and a bilingual (RU+EN) system prompt that constrains the response to a single token: `opus`, `sonnet`, or `haiku`.
 
 Routing rules:
 
 | Bucket | Intent | Model |
 |---|---|---|
-| `opus` | Write a new scene from scratch | `claude-opus-4-20250514` |
-| `sonnet` | Continue / rewrite / extend / edit existing text | `claude-sonnet-4-20250514` |
-| `haiku` | Discussion, questions, short replies, meta-talk | `claude-haiku-4-5-20251001` |
+| `opus` | Write a new scene from scratch | `claude-opus-4-8` |
+| `sonnet` | Continue / rewrite / extend / edit existing text | `claude-sonnet-4-6` |
+| `haiku` | Discussion, questions, short replies, meta-talk | `claude-haiku-4-5` |
 
 Output is parsed by substring match against the three aliases; on any error or malformed response the bot defaults to `haiku`. Every classifier call is metered and counted toward `/cost`.
 
@@ -38,9 +38,9 @@ A per-chat manual override is persisted in `models/<chat_id>.txt`:
 `handle_message` logs which path was taken on every turn:
 
 ```
-[chat 12345] [router → opus] (claude-opus-4-20250514) | msg: '...'
-[chat 12345] [manual → sonnet] (claude-sonnet-4-20250514) | msg: '...'
-[chat 12345] [scene → opus] (claude-opus-4-20250514) | desc: '...'
+[chat 12345] [router → opus] (claude-opus-4-8) | msg: '...'
+[chat 12345] [manual → sonnet] (claude-sonnet-4-6) | msg: '...'
+[chat 12345] [scene → opus] (claude-opus-4-8) | desc: '...'
 ```
 
 ## Prompt caching
@@ -82,9 +82,9 @@ Every API call (main, classifier, summarizer) increments per-chat counters via `
 
 ```python
 PRICING = {
-    "claude-opus-4-20250514":      {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
-    "claude-sonnet-4-20250514":    {"in":  3.0, "out": 15.0, "cw":  3.75, "cr": 0.30},
-    "claude-haiku-4-5-20251001":   {"in":  0.80, "out":  4.0, "cw":  1.00, "cr": 0.08},
+    "claude-opus-4-8":      {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
+    "claude-sonnet-4-6":    {"in":  3.0, "out": 15.0, "cw":  3.75, "cr": 0.30},
+    "claude-haiku-4-5":   {"in":  0.80, "out":  4.0, "cw":  1.00, "cr": 0.08},
 }
 ```
 
@@ -145,7 +145,7 @@ Read from `.env` next to the script (loader is hand-rolled, no dotenv dependency
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
 | `ANTHROPIC_API_KEY` | required | Anthropic API key |
 | `ALLOWED_USERS` | empty (open) | Comma-separated Telegram user IDs |
-| `CLAUDE_MODEL` | `claude-opus-4-20250514` | Fallback model when mode is `auto` and `/regenerate` is invoked |
+| `CLAUDE_MODEL` | `claude-opus-4-8` | Fallback model when mode is `auto` and `/regenerate` is invoked |
 | `MAX_HISTORY` | `25` | Turns retained in context |
 | `MAX_TOKENS` | `8000` | `max_tokens` for main generation |
 | `SYSTEM_PROMPT` | built-in | Default system prompt for new chats |
