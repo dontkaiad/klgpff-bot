@@ -98,9 +98,23 @@ for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR, OUTPUTS_DIR):
 LONG_REPLY_THRESHOLD = 1500
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
 )
+# Заглушаем болтливые библиотеки (getUpdates-поллинг, HTTP-строки), чтобы
+# в логе были видны наши собственные события.
+for _noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "apscheduler", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _tag(chat_id: int) -> str:
+    return f"[chat {chat_id}]"
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -137,23 +151,26 @@ def reindex_user_facts(user_id: int):
         logger.warning(f"RAG reindex skipped for user {user_id}: {e}")
 
 
-def get_relevant_facts(user_id: int, query: str) -> list[str]:
-    """RAG-поиск релевантных query фактов. Fallback на все факты:
-    при недоступности Qdrant, пустом query или если индекс ещё не наполнен."""
+def get_relevant_facts(user_id: int, query: str):
+    """RAG-поиск релевантных query фактов. Возвращает (facts, source), где
+    source — человекочитаемое описание источника для лога. Fallback на все
+    факты: при недоступности Qdrant, пустом query или ненаполненном индексе."""
     all_facts = load_facts(user_id)
-    if not query or not all_facts:
-        return all_facts
+    if not all_facts:
+        return [], "no facts stored"
+    if not query:
+        return all_facts, "all (no query)"
     try:
         hits = rag.search_facts(user_id, query)
         if hits:
-            return hits
+            return hits, "semantic"
         # Qdrant доступен, но факты ещё не проиндексированы (напр. первый
         # запуск после деплоя) — наполняем индекс и используем все факты.
         reindex_user_facts(user_id)
-        return all_facts
+        return all_facts, "fallback — index empty, backfilled"
     except Exception as e:
         logger.warning(f"RAG search failed, fallback to all facts: {e}")
-        return all_facts
+        return all_facts, "fallback — Qdrant unavailable"
 
 
 # --- Промпты ---
@@ -269,19 +286,23 @@ def save_usage(chat_id: int, data: dict):
     )
 
 
+def usage_bucket(response_usage) -> dict:
+    """Извлекает токены из Anthropic usage в плоский bucket-словарь."""
+    return {
+        "input": getattr(response_usage, "input_tokens", 0) or 0,
+        "output": getattr(response_usage, "output_tokens", 0) or 0,
+        "cache_read": getattr(response_usage, "cache_read_input_tokens", 0) or 0,
+        "cache_write": getattr(response_usage, "cache_creation_input_tokens", 0) or 0,
+    }
+
+
 def add_usage(chat_id: int, model: str, response_usage):
     data = load_usage(chat_id)
     bucket = data.setdefault(
         model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     )
-    bucket["input"] += getattr(response_usage, "input_tokens", 0) or 0
-    bucket["output"] += getattr(response_usage, "output_tokens", 0) or 0
-    bucket["cache_read"] += (
-        getattr(response_usage, "cache_read_input_tokens", 0) or 0
-    )
-    bucket["cache_write"] += (
-        getattr(response_usage, "cache_creation_input_tokens", 0) or 0
-    )
+    for k, v in usage_bucket(response_usage).items():
+        bucket[k] += v
     save_usage(chat_id, data)
 
 
@@ -577,6 +598,7 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{history[-1]['content']}\n\n[правка: {note}]"
         )
     conversations[chat_id] = history
+    logger.info(f"{_tag(chat_id)} 🔁 regenerate" + (f' (edit: "{note[:60]}")' if note else ""))
     await _generate_and_reply(update, chat_id, user_id, history)
 
 
@@ -615,9 +637,9 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = trim_history(history)
     conversations[chat_id] = history
 
-    logger.info(
-        f"[chat {chat_id}] [scene → opus] ({MODELS['opus']}) | desc: {desc[:60]!r}"
-    )
+    tag = _tag(chat_id)
+    logger.info(f'{tag} 📩 /scene "{desc[:80]}"')
+    logger.info(f"{tag} 📌 scene → opus ({MODELS['opus']})")
     await _generate_and_reply(
         update, chat_id, user_id, history, model_override=MODELS["opus"]
     )
@@ -680,18 +702,22 @@ def save_output(chat_id: int, text: str) -> Path:
 
 
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
+    tag = _tag(chat_id)
     base_prompt = load_prompt(chat_id)
     last_user_msg = next(
         (m["content"] for m in reversed(history) if m["role"] == "user"), ""
     )
-    facts = get_relevant_facts(user_id, last_user_msg)
+    facts, fact_source = get_relevant_facts(user_id, last_user_msg)
     system_prompt = build_system_prompt(base_prompt, facts)
     model = model_override or load_model(chat_id)
+    facts_chars = len(system_prompt) - len(base_prompt)
 
+    logger.info(f"{tag} 🔍 RAG: {len(facts)} facts ({fact_source})")
     logger.info(
-        f"[chat {chat_id}] [{model}] sending system={len(system_prompt)} chars "
-        f"(base_prompt={len(base_prompt)}, facts={len(facts)}), history={len(history)} msgs"
+        f"{tag} 🧠 prompt: {len(system_prompt)} chars "
+        f"(base {len(base_prompt)} + facts {facts_chars}), history {len(history)} msgs"
     )
+    logger.info(f"{tag} ✍️ generating...")
 
     await update.effective_chat.send_action("typing")
 
@@ -710,20 +736,33 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         conversations[chat_id] = trim_history(history)
         add_usage(chat_id, model, final.usage)
 
-        for chunk in split_by_paragraphs(assistant_text):
+        chunks = split_by_paragraphs(assistant_text)
+        for chunk in chunks:
             await update.message.reply_text(chunk)
 
-        if len(assistant_text) > LONG_REPLY_THRESHOLD:
+        saved_file = len(assistant_text) > LONG_REPLY_THRESHOLD
+        if saved_file:
             path = save_output(chat_id, assistant_text)
             with path.open("rb") as f:
                 await update.message.reply_document(
                     document=f, filename=path.name
                 )
+
+        u = usage_bucket(final.usage)
+        alias = model_alias(model) or model
+        req_cost = cost_for_model(model, u)
+        file_part = " + file" if saved_file else ""
+        logger.info(
+            f"{tag} ✅ done: {len(assistant_text)} chars → "
+            f"{len(chunks)} messages{file_part} | "
+            f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out | "
+            f"${req_cost:.2f}"
+        )
     except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
+        logger.error(f"{tag} ❌ Anthropic API error: {e}")
         await update.message.reply_text(f"ошибка API: {e.message}")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"{tag} ❌ error: {e}")
         await update.message.reply_text(f"ошибка: {str(e)}")
 
 
@@ -806,6 +845,9 @@ async def _process_user_text(update: Update, user_text: str):
     history = trim_history(history)
     conversations[chat_id] = history
 
+    tag = _tag(chat_id)
+    logger.info(f'{tag} 📩 "{user_text[:80]}"')
+
     mode = load_mode(chat_id)
     if mode == "auto":
         alias = classify_message(chat_id, user_text)
@@ -814,9 +856,8 @@ async def _process_user_text(update: Update, user_text: str):
         alias = mode
         source = "manual"
     model_id = MODELS[alias]
-    logger.info(
-        f"[chat {chat_id}] [{source} → {alias}] ({model_id}) | msg: {user_text[:60]!r}"
-    )
+    icon = "🧭" if source == "router" else "📌"
+    logger.info(f"{tag} {icon} {source} → {alias} ({model_id})")
 
     await _generate_and_reply(
         update, chat_id, user_id, history, model_override=model_id
@@ -876,7 +917,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("бот запущен")
+    logger.info("🚀 бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
