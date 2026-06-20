@@ -225,12 +225,22 @@ def load_model(chat_id: int) -> str:
     return MODELS[mode]
 
 
+# Деприкейтнутые ID, под которыми писался usage до перехода на новые версии.
+# Нужны чтобы /cost не терял исторические расходы после ребренда модели.
+LEGACY_MODEL_ALIASES = {
+    "claude-opus-4-20250514": "opus",
+    "claude-sonnet-4-20250514": "sonnet",
+    "claude-haiku-4-5-20251001": "haiku",
+}
+
+
 def model_alias(model_id: str) -> str:
-    """Reverse MODELS: concrete id → alias (opus/sonnet/haiku). '' if unknown."""
+    """Reverse MODELS: concrete id → alias (opus/sonnet/haiku). Резолвит и
+    текущие ID из MODELS, и деприкейтнутые legacy-ID. '' если неизвестен."""
     for alias, full in MODELS.items():
         if full == model_id:
             return alias
-    return ""
+    return LEGACY_MODEL_ALIASES.get(model_id, "")
 
 
 def model_label(model_id: str) -> str:
