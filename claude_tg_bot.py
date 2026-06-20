@@ -676,16 +676,19 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     await update.effective_chat.send_action("typing")
 
     try:
-        response = client.messages.create(
+        # Streaming обязателен: при больших max_tokens (32000) генерация
+        # может занять >10 мин, и SDK без stream бросает ошибку.
+        with client.messages.stream(
             model=model,
             max_tokens=MAX_TOKENS,
             system=system_block(system_prompt),
             messages=history,
-        )
-        assistant_text = response.content[0].text
+        ) as stream:
+            final = stream.get_final_message()
+        assistant_text = final.content[0].text
         history.append({"role": "assistant", "content": assistant_text})
         conversations[chat_id] = trim_history(history)
-        add_usage(chat_id, model, response.usage)
+        add_usage(chat_id, model, final.usage)
 
         for chunk in split_by_paragraphs(assistant_text):
             await update.message.reply_text(chunk)
