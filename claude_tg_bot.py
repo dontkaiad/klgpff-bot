@@ -8,9 +8,11 @@ Telegram-бот для creative writing через Anthropic API.
 3. python claude_tg_bot.py
 """
 
+import asyncio
 import json
 import os
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -943,9 +945,29 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
     return chunks
 
 
+HEARTBEAT_PATH = "/tmp/heartbeat"
+HEARTBEAT_INTERVAL = 30
+
+
+async def heartbeat_loop():
+    """Раз в HEARTBEAT_INTERVAL сек пишет unix-время в HEARTBEAT_PATH — внешний
+    healthcheck считает бота живым, пока файл свежий. Ошибка записи не должна
+    ронять бота: тело цикла под try/except, sleep — снаружи (на ошибке всё
+    равно ждём интервал, без busy-loop)."""
+    while True:
+        try:
+            Path(HEARTBEAT_PATH).write_text(str(int(time.time())), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"heartbeat write failed: {e}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 async def register_commands(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
     await send_log("🚀 klgpff поднялся")
+    # PTB-tracked task: держит strong-ref (без GC-гонки голого create_task) и
+    # отменяется при shutdown'е приложения.
+    app.create_task(heartbeat_loop())
 
 
 async def error_handler(update, context):
