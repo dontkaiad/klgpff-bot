@@ -1,0 +1,10 @@
+services:
+  klgpff-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./facts:/app/facts
+      - ./prompts:/app/prompts
+      - ./models:/app/models
+      - ./outputs:/app/outputs
