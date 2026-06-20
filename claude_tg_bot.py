@@ -721,6 +721,7 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_usage(chat_id, SUMMARY_MODEL, response.usage)
     except Exception as e:
         logger.error(f"summarize error: {e}")
+        await send_log(f"🔴 klgpff summarize error: {e!r}")
         await update.message.reply_text(f"ошибка summarize: {e}")
         return
 
@@ -756,6 +757,12 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     facts_chars = len(system_prompt) - len(base_prompt)
 
     logger.info(f"{tag} 🔍 RAG: {len(facts)} facts ({fact_source})")
+    # get_relevant_facts() гасит исключение Qdrant внутри (sync, без await) и
+    # сообщает о деградации через fact_source — логируем её здесь, в async-точке.
+    if "Qdrant unavailable" in fact_source:
+        await send_log(
+            f"⚠️ klgpff RAG fallback: Qdrant unavailable ({len(facts)} facts used)"
+        )
     logger.info(
         f"{tag} 🧠 prompt: {len(system_prompt)} chars "
         f"(base {len(base_prompt)} + facts {facts_chars}), history {len(history)} msgs"
@@ -803,9 +810,11 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         )
     except anthropic.APIError as e:
         logger.error(f"{tag} ❌ Anthropic API error: {e}")
+        await send_log(f"🔴 klgpff generate API error: {e!r}")
         await update.message.reply_text(f"ошибка API: {e.message}")
     except Exception as e:
         logger.error(f"{tag} ❌ error: {e}")
+        await send_log(f"🔴 klgpff generate error: {e!r}")
         await update.message.reply_text(f"ошибка: {str(e)}")
 
 
@@ -826,8 +835,10 @@ CLASSIFIER_PROMPT = (
 )
 
 
-def classify_message(chat_id: int, user_text: str) -> str:
-    """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'haiku' on any error."""
+async def classify_message(chat_id: int, user_text: str) -> str:
+    """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'haiku' on any error.
+    async только ради await send_log в фолбэке; сам вызов client остаётся
+    синхронным, как и в остальном коде."""
     try:
         response = client.messages.create(
             model=CLASSIFIER_MODEL,
@@ -842,6 +853,7 @@ def classify_message(chat_id: int, user_text: str) -> str:
                 return alias
     except Exception as e:
         logger.warning(f"classify_message fallback to haiku: {e}")
+        await send_log(f"⚠️ klgpff classifier fallback→haiku: {e!r}")
     return "haiku"
 
 
@@ -859,6 +871,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_text = file_bytes.decode("utf-8", errors="replace")
     except Exception as e:
         logger.error(f"document read error: {e}")
+        await send_log(f"🔴 klgpff document read error: {e!r}")
         await update.message.reply_text(f"не смогла прочитать файл: {e}")
         return
 
@@ -893,7 +906,7 @@ async def _process_user_text(update: Update, user_text: str):
 
     mode = load_mode(chat_id)
     if mode == "auto":
-        alias = classify_message(chat_id, user_text)
+        alias = await classify_message(chat_id, user_text)
         source = "router"
     else:
         alias = mode
@@ -932,7 +945,14 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
 
 async def register_commands(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
-    await send_log("✅ klgpff bot started")
+    await send_log("🚀 klgpff поднялся")
+
+
+async def error_handler(update, context):
+    """Глобальный хук PTB: ловит ИСКЛЮЧЕНИЯ, не пойманные в хендлерах.
+    Локальные try/except (generate/summary/classifier) гасят свои ошибки и
+    логируют сами — сюда они не доходят, дублей нет. Шлём тип+текст, не трейс."""
+    await send_log(f"🔴 klgpff error: {context.error!r}")
 
 
 def main():
@@ -960,6 +980,8 @@ def main():
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.add_error_handler(error_handler)
 
     restore_facts_from_backups()
     logger.info("🚀 бот запущен")
