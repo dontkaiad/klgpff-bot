@@ -32,6 +32,7 @@ load_dotenv()
 
 import anthropic
 import rag
+from tg_logger import send_log
 from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
@@ -931,6 +932,7 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
 
 async def register_commands(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+    await send_log("✅ klgpff bot started")
 
 
 def main():
