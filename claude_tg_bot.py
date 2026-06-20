@@ -31,6 +31,7 @@ def load_dotenv():
 load_dotenv()
 
 import anthropic
+import rag
 from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
@@ -43,6 +44,7 @@ from telegram.ext import (
 # --- Конфиг ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")  # для RAG (rag.py)
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-20250514")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "25"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
@@ -122,6 +124,33 @@ def save_facts(user_id: int, facts: list[str]):
     facts_path(user_id).write_text(
         json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def reindex_user_facts(user_id: int):
+    """Переиндексирует факты юзера в Qdrant. Тихо логирует при недоступности RAG."""
+    try:
+        rag.index_facts(user_id, load_facts(user_id))
+    except Exception as e:
+        logger.warning(f"RAG reindex skipped for user {user_id}: {e}")
+
+
+def get_relevant_facts(user_id: int, query: str) -> list[str]:
+    """RAG-поиск релевантных query фактов. Fallback на все факты:
+    при недоступности Qdrant, пустом query или если индекс ещё не наполнен."""
+    all_facts = load_facts(user_id)
+    if not query or not all_facts:
+        return all_facts
+    try:
+        hits = rag.search_facts(user_id, query)
+        if hits:
+            return hits
+        # Qdrant доступен, но факты ещё не проиндексированы (напр. первый
+        # запуск после деплоя) — наполняем индекс и используем все факты.
+        reindex_user_facts(user_id)
+        return all_facts
+    except Exception as e:
+        logger.warning(f"RAG search failed, fallback to all facts: {e}")
+        return all_facts
 
 
 # --- Промпты ---
@@ -381,6 +410,7 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
     facts = load_facts(user_id)
     facts.append(text)
     save_facts(user_id, facts)
+    reindex_user_facts(user_id)
     await update.message.reply_text(f"✓ запомнила ({len(facts)})")
 
 
@@ -397,6 +427,7 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if arg.lower() == "all":
         save_facts(user_id, [])
+        reindex_user_facts(user_id)
         await update.message.reply_text("все факты удалены.")
         return
 
@@ -405,6 +436,7 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(facts):
             removed = facts.pop(idx)
             save_facts(user_id, facts)
+            reindex_user_facts(user_id)
             await update.message.reply_text(f"удалён: {removed}")
         else:
             await update.message.reply_text(
@@ -629,7 +661,10 @@ def save_output(chat_id: int, text: str) -> Path:
 
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
     base_prompt = load_prompt(chat_id)
-    facts = load_facts(user_id)
+    last_user_msg = next(
+        (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+    )
+    facts = get_relevant_facts(user_id, last_user_msg)
     system_prompt = build_system_prompt(base_prompt, facts)
     model = model_override or load_model(chat_id)
 

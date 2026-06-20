@@ -1,2 +1,4 @@
 python-telegram-bot
 anthropic
+voyageai
+qdrant-client

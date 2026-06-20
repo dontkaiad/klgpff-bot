@@ -3,8 +3,19 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      - qdrant
     volumes:
       - ./facts:/app/facts
       - ./prompts:/app/prompts
       - ./models:/app/models
       - ./outputs:/app/outputs
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
