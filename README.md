@@ -162,6 +162,16 @@ All of the above are in `.gitignore` — private content never leaks.
 - Anthropic API key
 - Telegram bot token (from [@BotFather](https://t.me/BotFather))
 
+## ⚙️ Engineering highlights
+
+- **Cost-aware model routing** — a Haiku classifier picks Opus / Sonnet / Haiku per task, so expensive models run only where they earn it
+- **RAG character memory** — Voyage embeddings + Qdrant, semantic retrieval instead of context-stuffing
+- **Raw API over a managed platform** — full control of the system prompt, model selection, and generation params
+- **File-based persistence, streaming generation, graceful degradation** — small footprint, debuggable, falls back instead of failing
+- **Dockerized, auto-deployed** via GitHub Actions on push to `main`
+
+Full engineering writeup → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
 ## Why
 
 Because claude.ai filters explicit content, and fanfiction has to get written.
