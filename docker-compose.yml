@@ -10,6 +10,7 @@ services:
       - ./prompts:/app/prompts
       - ./models:/app/models
       - ./outputs:/app/outputs
+      - ./backups:/app/backups
 
   qdrant:
     image: qdrant/qdrant:latest

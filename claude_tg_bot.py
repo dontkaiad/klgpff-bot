@@ -92,8 +92,12 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 MODELS_DIR = BASE_DIR / "models"
 USAGE_DIR = BASE_DIR / "usage"
 OUTPUTS_DIR = BASE_DIR / "outputs"
+# Бэкапы фактов живут ВНЕ facts/, в отдельном volume — чтобы reset/пересборка
+# рабочей папки facts/ не уносила единственную копию (источник правды — сервер).
+FACTS_BACKUP_DIR = BASE_DIR / "backups" / "facts"
 for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR, OUTPUTS_DIR):
     d.mkdir(exist_ok=True)
+FACTS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 LONG_REPLY_THRESHOLD = 1500
 
@@ -126,21 +130,59 @@ def facts_path(user_id: int) -> Path:
     return FACTS_DIR / f"{user_id}.json"
 
 
-def load_facts(user_id: int) -> list[str]:
-    path = facts_path(user_id)
+def facts_backup_path(user_id: int) -> Path:
+    return FACTS_BACKUP_DIR / f"{user_id}.json"
+
+
+def _read_facts_file(path: Path) -> list[str]:
     if not path.exists():
         return []
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
-        logger.error(f"failed to load facts for user {user_id} from {path}: {e}")
+        logger.error(f"failed to read facts from {path}: {e}")
         return []
 
 
+def load_facts(user_id: int) -> list[str]:
+    return _read_facts_file(facts_path(user_id))
+
+
+def _dump_facts(facts: list[str]) -> str:
+    return json.dumps(facts, ensure_ascii=False, indent=2)
+
+
 def save_facts(user_id: int, facts: list[str]):
-    facts_path(user_id).write_text(
-        json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    facts_path(user_id).write_text(_dump_facts(facts), encoding="utf-8")
+    # Зеркалируем в backups/ вне facts/ — переживает reset/пересборку рабочей папки.
+    try:
+        facts_backup_path(user_id).write_text(_dump_facts(facts), encoding="utf-8")
+        logger.info(f"[user {user_id}] 💾 backup saved ({len(facts)} facts)")
+    except Exception as e:
+        logger.warning(f"facts backup failed for user {user_id}: {e}")
+
+
+def restore_facts_from_backups():
+    """На старте: если рабочий facts/<id>.json пуст/отсутствует, а в backups/
+    есть непустая копия — восстановить файл и переиндексировать в Qdrant."""
+    for bpath in sorted(FACTS_BACKUP_DIR.glob("*.json")):
+        try:
+            user_id = int(bpath.stem)
+        except ValueError:
+            continue
+        backup_facts = _read_facts_file(bpath)
+        if not backup_facts:
+            continue  # пустой бэкап — восстанавливать нечего
+        if load_facts(user_id):
+            continue  # рабочий файл на месте и непустой — не трогаем
+        facts_path(user_id).write_text(_dump_facts(backup_facts), encoding="utf-8")
+        logger.info(
+            f"[user {user_id}] ♻️ facts restored from backup ({len(backup_facts)} facts)"
+        )
+        try:
+            rag.index_facts(user_id, backup_facts)
+        except Exception as e:
+            logger.warning(f"RAG reindex after restore skipped for user {user_id}: {e}")
 
 
 def reindex_user_facts(user_id: int):
@@ -917,6 +959,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    restore_facts_from_backups()
     logger.info("🚀 бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

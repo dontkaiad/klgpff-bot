@@ -9,6 +9,7 @@ prompts/
 models/
 usage/
 outputs/
+backups/
 *.json
 *.pkl
 

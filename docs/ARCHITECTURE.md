@@ -175,6 +175,15 @@ embeddings, Qdrant for vector search, flat files for state. Packaged as a Docker
 image; Qdrant runs as a sibling service in `docker-compose`. Deployment is a GitHub
 Actions workflow that SSHes to the server on push to `main`, pulls, and rebuilds.
 
+**Backups.** Facts are the only irreplaceable state (the user authors them by hand),
+so they get a belt-and-suspenders treatment. Every write mirrors to a separate
+`backups/` volume and is restored on startup if the working copy is wiped — protection
+against a `git reset --hard` or volume rebuild. On top of that, a cron-driven script
+(`scripts/backup_facts.sh`) tars `facts/` + `prompts/`, encrypts them with `gpg`
+(symmetric AES256), and keeps a rolling 14-archive window. Restore is documented in the
+[README](../README.md#backups). The principle: *the server is the source of truth, so
+the source of truth is the thing you back up twice.*
+
 ## How it evolved
 
 It started as a **local script on a laptop** — one file, JSON facts on disk, run by

@@ -77,6 +77,21 @@ All of the above are in `.gitignore` — private content never leaks.
 - Anthropic API key
 - Telegram bot token (from [@BotFather](https://t.me/BotFather))
 
+## Backups
+
+Facts are the only user-authored state, so they're protected two ways:
+
+- **Instant mirror.** Every `/remember` / `/forget` writes `facts/<id>.json` and a copy under `backups/facts/<id>.json` (a separate volume). On startup, if a working facts file is missing or empty but a non-empty backup exists, the bot restores it and re-indexes into Qdrant (`♻️ facts restored from backup`). This survives a `git reset --hard` or container rebuild of the `facts/` volume.
+- **Periodic encrypted archive.** `scripts/backup_facts.sh` tars `facts/` + `prompts/`, encrypts with `gpg` (symmetric, AES256, passphrase from `BACKUP_PASSPHRASE`), and writes `backups/archive/facts-<timestamp>.tar.gz.gpg`, keeping the 14 newest. Run it daily on the server via cron (example crontab line is in the script header). Requires `gpg` installed on the host.
+
+**Restore from an encrypted archive:**
+
+```bash
+gpg -d backups/archive/facts-YYYYMMDD-HHMMSS.tar.gz.gpg | tar -xzf -
+```
+
+This recreates `facts/` and `prompts/` in the current directory. (Older `gpg` may need `gpg -d --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" ...`.)
+
 ## ⚙️ Engineering highlights
 
 - **Cost-aware model routing** — a Haiku classifier picks Opus / Sonnet / Haiku per task, so expensive models run only where they earn it
