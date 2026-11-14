@@ -60,7 +60,7 @@ CACHE_TTL = os.environ.get("CACHE_TTL", "1h")
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "30"))
 RAG_MAX_FACTS = int(os.environ.get("RAG_MAX_FACTS", "50"))
 # Пока фактов не больше этого порога — отдаём все без поиска (0 = RAG всегда).
-FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "0"))
+FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "150"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
@@ -335,7 +335,8 @@ VALID_MODES = ("auto", "opus", "sonnet", "haiku")
 
 
 def load_mode(chat_id: int) -> str:
-    """Returns one of VALID_MODES. Default 'auto'."""
+    """Returns one of VALID_MODES. Default 'opus' (сцены пишет Opus, роутер
+    включается явно через /model auto)."""
     path = model_path(chat_id)
     if path.exists():
         try:
@@ -344,7 +345,7 @@ def load_mode(chat_id: int) -> str:
                 return v
         except Exception:
             pass
-    return "auto"
+    return "opus"
 
 
 def save_mode(chat_id: int, mode: str):
@@ -520,8 +521,8 @@ HELP_TEXT = (
     "/setsystem <текст> — задать новый (заменяет)\n"
     "/addprompt <текст> — добавить к существующему\n"
     "/model — текущий режим\n"
-    "/model auto — классификатор решает (дефолт)\n"
-    "/model opus|sonnet|haiku — всегда эта модель, классификатор off\n\n"
+    "/model auto — классификатор решает\n"
+    "/model opus|sonnet|haiku — всегда эта модель, классификатор off (дефолт: opus)\n\n"
     "💸 /cost — расходы по этому чату\n"
     "ℹ️ /help — это сообщение"
 )
@@ -537,7 +538,7 @@ BOT_COMMANDS = [
     ("system", "текущий system prompt"),
     ("setsystem", "задать новый system prompt"),
     ("addprompt", "добавить к существующему промпту"),
-    ("model", "режим модели (auto/opus/sonnet/haiku)"),
+    ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
     ("cost", "расходы по этому чату"),
     ("help", "список команд"),
 ]
