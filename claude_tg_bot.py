@@ -720,6 +720,35 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _generate_and_reply(update, chat_id, user_id, history)
 
 
+async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    desc = update.message.text.partition(" ")[2].strip()
+    if not desc:
+        await update.message.reply_text(
+            "напиши описание после /scene\n"
+            "пример: /scene первая встреча героев в портовом городе"
+        )
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    wrapped = (
+        "Напиши длинную атмосферную сцену. Используй все факты о персонажах. "
+        f"Минимум 1500 слов. Описание сцены: {desc}"
+    )
+    history = get_history(chat_id)
+    history.append({"role": "user", "content": wrapped})
+    history = trim_history(history)
+    conversations[chat_id] = history
+
+    tag = _tag(chat_id)
+    logger.info(f'{tag} 📩 /scene "{desc[:80]}"')
+    logger.info(f"{tag} 📌 scene → opus ({MODELS['opus']})")
+    await _generate_and_reply(
+        update, chat_id, user_id, history, model_override=MODELS["opus"]
+    )
+
+
 async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
