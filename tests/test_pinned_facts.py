@@ -270,23 +270,6 @@ class TestCommandsAndIndexing(unittest.TestCase):
         self.assertEqual(restored, [f"{PIN} закреплённый", "обычный"])  # файл с маркером
         self.assertEqual(index.call_args.args, (777, ["закреплённый", "обычный"]))
 
-    def test_facts_command_shows_marker(self):
-        # /facts показывает факты как хранятся, чтобы было видно, какие закреплены.
-        (self.tmp / "facts" / "555.json").write_text(
-            json.dumps([f"{PIN} закреплённый факт", "обычный"], ensure_ascii=False), encoding="utf-8"
-        )
-        sent = []
-
-        async def reply_text(t):
-            sent.append(t)
-
-        update = SimpleNamespace(
-            effective_user=SimpleNamespace(id=555),
-            message=SimpleNamespace(text="/facts", reply_text=reply_text),
-        )
-        asyncio.run(bot.cmd_facts(update, None))
-        self.assertIn(f"1. {PIN} закреплённый факт", sent[0])
-
 
 if __name__ == "__main__":
     unittest.main()

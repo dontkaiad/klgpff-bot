@@ -70,7 +70,6 @@ MODELS = {
     "sonnet": os.environ.get("MODEL_SONNET", "claude-sonnet-5-5"),
     "haiku": os.environ.get("MODEL_HAIKU", "claude-haiku-5-5"),
 }
-SUMMARY_MODEL = MODELS["haiku"]
 CLASSIFIER_MODEL = MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
@@ -553,16 +552,12 @@ HELP_TEXT = (
     "/new — новый диалог (сбросить контекст)\n"
     "/scene <описание> — длинная сцена через opus (1500+ слов)\n"
     "/regenerate [правка] — перегенерить последний ответ (с опц. правкой)\n"
-    "/summarize — сжать историю через haiku, чтобы экономить токены\n"
     "\n"
     "🧠 память (сохраняется между сессиями):\n"
     "/remember <факт> — запомнить (📌 в начале закрепляет: факт всегда в промпте)\n"
     "/forget <номер> — забыть по номеру\n"
-    "/forget all — забыть всё\n"
-    "/facts — все факты\n\n"
+    "/forget all — забыть всё\n\n"
     "⚙️ настройки:\n"
-    "/system — текущий system prompt\n"
-    "/setsystem <текст> — задать новый (заменяет)\n"
     "/addprompt <текст> — добавить к существующему\n"
     "/model — текущий режим\n"
     "/model auto — классификатор решает\n"
@@ -575,12 +570,8 @@ BOT_COMMANDS = [
     ("new", "новый диалог (сбросить контекст)"),
     ("scene", "длинная сцена через opus (1500+ слов)"),
     ("regenerate", "перегенерить последний ответ (можно с правкой)"),
-    ("summarize", "сжать историю через haiku"),
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
-    ("facts", "показать все факты"),
-    ("system", "текущий system prompt"),
-    ("setsystem", "задать новый system prompt"),
     ("addprompt", "добавить к существующему промпту"),
     ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
     ("cost", "расходы по этому чату"),
@@ -663,28 +654,6 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    facts = load_facts(update.effective_user.id)
-    if not facts:
-        await update.message.reply_text("пусто. добавь через /remember <факт>")
-        return
-    items = [f"{i + 1}. {f}" for i, f in enumerate(facts)]
-    text = "🧠 факты:\n\n" + "\n\n".join(items)
-    for chunk in split_by_paragraphs(text):
-        await update.message.reply_text(chunk)
-
-
-async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    prompt = load_prompt(update.effective_chat.id)
-    text = f"system prompt:\n\n{prompt}"
-    for chunk in split_by_paragraphs(text):
-        await update.message.reply_text(chunk)
-
-
 async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -696,19 +665,6 @@ async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = load_prompt(chat_id)
     save_prompt(chat_id, current + "\n\n" + text)
     await update.message.reply_text("✓ добавлено к промпту.")
-
-
-async def cmd_setsystem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("напиши промпт после /setsystem")
-        return
-    chat_id = update.effective_chat.id
-    save_prompt(chat_id, text)
-    conversations[chat_id] = []
-    await update.message.reply_text("system prompt обновлён, контекст сброшен.")
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,54 +759,6 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _generate_and_reply(
         update, chat_id, user_id, history, model_override=MODELS["opus"]
     )
-
-
-async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    chat_id = update.effective_chat.id
-    history = get_history(chat_id)
-    if len(history) < 4:
-        await update.message.reply_text(
-            "история слишком короткая, нечего сжимать."
-        )
-        return
-
-    transcript = "\n\n".join(
-        f"[{m['role']}] {m['content']}" for m in history
-    )
-    prompt = (
-        "Ниже — диалог между пользователем и ассистентом-писателем. "
-        "Сожми его в краткое содержание (до 500 слов): кто персонажи, "
-        "что произошло, в какой точке остановились, какой тон и стиль. "
-        "Сохрани важные детали и факты.\n\n"
-        f"{transcript}"
-    )
-
-    await update.effective_chat.send_action("typing")
-    try:
-        response = client.messages.create(
-            model=SUMMARY_MODEL,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        summary = response_text(response)
-        add_usage(chat_id, SUMMARY_MODEL, response.usage)
-    except Exception as e:
-        logger.error(f"summarize error: {e}")
-        await send_log(f"🔴 klgpff summarize error: {e!r}")
-        await update.message.reply_text(f"ошибка summarize: {e}")
-        return
-
-    conversations[chat_id] = [
-        {"role": "user", "content": "Что произошло до этого момента?"},
-        {"role": "assistant", "content": summary},
-    ]
-    await update.message.reply_text(
-        "✓ история сжата. краткое содержание:"
-    )
-    for chunk in split_by_paragraphs(summary):
-        await update.message.reply_text(chunk)
 
 
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
@@ -1029,6 +937,18 @@ async def _process_user_text(update: Update, user_text: str):
     )
 
 
+async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Одна строка в лог на каждую команду: имя и user_id, без текста сообщения.
+    Стоит в группе -1 и ничего не блокирует: хендлеры команд в группе 0 отработают
+    как обычно. Ловит и неизвестные команды, и команды от чужих пользователей."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not msg.text:
+        return
+    name = msg.text.split(maxsplit=1)[0].lstrip("/").split("@")[0].lower()
+    logger.info(f"⌨️ command /{name} user={user.id if user else '?'}")
+
+
 def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
     """Разбивает текст по абзацам, не превышая лимит символов."""
     paragraphs = text.split("\n\n")
@@ -1092,19 +1012,17 @@ def main():
         .build()
     )
 
+    # группа -1: логирование всех команд до основных хендлеров (группа 0)
+    app.add_handler(MessageHandler(filters.COMMAND, log_command), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("forget", cmd_forget))
-    app.add_handler(CommandHandler("facts", cmd_facts))
-    app.add_handler(CommandHandler("system", cmd_system))
     app.add_handler(CommandHandler("addprompt", cmd_addprompt))
-    app.add_handler(CommandHandler("setsystem", cmd_setsystem))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("regenerate", cmd_regenerate))
-    app.add_handler(CommandHandler("summarize", cmd_summarize))
     app.add_handler(CommandHandler("scene", cmd_scene))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
