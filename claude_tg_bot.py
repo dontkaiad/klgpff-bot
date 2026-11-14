@@ -187,7 +187,7 @@ def save_facts(user_id: int, facts: list[str]):
 
 def restore_facts_from_backups():
     """На старте: если рабочий facts/<id>.json пуст/отсутствует, а в backups/
-    есть непустая копия — восстановить файл и переиндексировать в Qdrant."""
+    есть непустая копия — восстановить файл и переиндексировать в pgvector."""
     for bpath in sorted(FACTS_BACKUP_DIR.glob("*.json")):
         try:
             user_id = int(bpath.stem)
@@ -209,7 +209,7 @@ def restore_facts_from_backups():
 
 
 def reindex_user_facts(user_id: int):
-    """Переиндексирует факты юзера в Qdrant. Тихо логирует при недоступности RAG."""
+    """Переиндексирует факты юзера в pgvector. Тихо логирует при недоступности RAG."""
     try:
         rag.index_facts(user_id, load_facts(user_id))
     except Exception as e:
@@ -232,7 +232,7 @@ def retrieval_queries(history: list[dict]) -> list[str]:
 def get_relevant_facts(user_id: int, history: list[dict]):
     """Факты для текущего запроса. Возвращает (facts, source), где source —
     человекочитаемое описание источника для лога. Fallback на все факты:
-    при недоступности Qdrant, пустом запросе или ненаполненном индексе."""
+    при недоступности БД с векторами, пустом запросе или ненаполненном индексе."""
     all_facts = load_facts(user_id)
     if not all_facts:
         return [], "no facts stored"
@@ -247,13 +247,13 @@ def get_relevant_facts(user_id: int, history: list[dict]):
         )
         if hits:
             return hits, f"semantic ({len(queries)} queries)"
-        # Qdrant доступен, но факты ещё не проиндексированы (напр. первый
+        # БД доступна, но факты ещё не проиндексированы (напр. первый
         # запуск после деплоя) — наполняем индекс и используем все факты.
         reindex_user_facts(user_id)
         return all_facts, "fallback — index empty, backfilled"
     except Exception as e:
         logger.warning(f"RAG search failed, fallback to all facts: {e}")
-        return all_facts, "fallback — Qdrant unavailable"
+        return all_facts, "fallback — vector DB unavailable"
 
 
 # --- Промпты ---
@@ -815,11 +815,11 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     facts_chars = len(canon)
 
     logger.info(f"{tag} 🔍 RAG: {len(facts)} facts ({fact_source})")
-    # get_relevant_facts() гасит исключение Qdrant внутри (sync, без await) и
+    # get_relevant_facts() гасит исключение БД внутри (sync, без await) и
     # сообщает о деградации через fact_source — логируем её здесь, в async-точке.
-    if "Qdrant unavailable" in fact_source:
+    if "vector DB unavailable" in fact_source:
         await send_log(
-            f"⚠️ klgpff RAG fallback: Qdrant unavailable ({len(facts)} facts used)"
+            f"⚠️ klgpff RAG fallback: vector DB unavailable ({len(facts)} facts used)"
         )
     logger.info(
         f"{tag} 🧠 prompt: system {len(base_prompt)} chars + canon {facts_chars} chars, "

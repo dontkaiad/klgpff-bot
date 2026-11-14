@@ -75,7 +75,7 @@ and I treat it like one.
 prompt inflates context, costs tokens on every turn, and — worse — buries the few
 facts that matter for *this* scene under all the ones that don't.
 
-**Choice.** Facts are **embedded (Voyage) and indexed in Qdrant**, and each turn pulls
+**Choice.** Facts are **embedded (Voyage) and indexed in Postgres (pgvector)**, and each turn pulls
 the top-K semantically relevant to the current message instead of the whole pile. The
 model sees what's relevant, not everything.
 
@@ -85,9 +85,13 @@ canon, and signal-to-noise drops, which is how you get a model contradicting an
 established detail it technically "had."
 
 **Trade-off.** Semantic retrieval can miss the one fact a scene needed. So retrieval
-isn't load-bearing in the failure case: if Qdrant is unreachable, or the index hasn't
+isn't load-bearing in the failure case: if the database is unreachable, or the index hasn't
 been populated yet, the bot **falls back to the full fact list** and lazily backfills
 the index. Degraded, not broken.
+
+**Vector store.** pgvector in the existing Postgres rather than a dedicated vector
+database: at hundreds to thousands of facts an exact scan is fast and lossless (no ANN
+index, no recall trade-off), and it is one fewer service to run and back up.
 
 *The cheapest token is the one you never put in the prompt.*
 
@@ -158,7 +162,7 @@ flowchart TD
     R -->|discussion| GEN
     U -.fact context.-> RAG[RAG retrieval]
     RAG --> VO[[Voyage embeddings]]
-    RAG --> QD[[Qdrant top-K]]
+    RAG --> QD[[pgvector top-K]]
     RAG --> GEN[Streaming generation<br/>Opus / Sonnet / Haiku]
     GEN --> AN[[Anthropic API]]
     GEN --> OUT[Reply + file save]
@@ -167,8 +171,9 @@ flowchart TD
 ```
 
 **Stack.** Python (`python-telegram-bot`), the raw Anthropic SDK, Voyage for
-embeddings, Qdrant for vector search, flat files for state. Packaged as a Docker
-image; Qdrant runs as a sibling service in `docker-compose`. Deployment is a GitHub
+embeddings, Postgres with pgvector for vector search, flat files for state. Packaged
+as a Docker image; the bot joins the shared Postgres container's network and uses its
+own database and role. Deployment is a GitHub
 Actions workflow that SSHes to the server on push to `main`, pulls, and rebuilds.
 
 **Backups.** Facts are the only irreplaceable state (the user authors them by hand),

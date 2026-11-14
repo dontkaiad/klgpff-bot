@@ -3,8 +3,12 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
-    depends_on:
-      - qdrant
+    # Postgres с pgvector живёт в контейнере nexus-arcana-db (своя база и роль
+    # klgpff), поэтому бот подключён и к его сети. Недоступность БД не ломает
+    # бота: RAG падает на полный список фактов.
+    networks:
+      - default
+      - nexus_arcana
     volumes:
       - ./facts:/app/facts
       - ./prompts:/app/prompts
@@ -19,6 +23,8 @@ services:
       retries: 3
       start_period: 40s
 
+  # Остаток прежнего хранилища векторов: бот в него больше не ходит. Оставлен на
+  # время проверки pgvector ради отката, после проверки удалить сервис и том.
   qdrant:
     image: qdrant/qdrant:latest
     restart: unless-stopped
@@ -26,6 +32,11 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
+
+networks:
+  nexus_arcana:
+    external: true
+    name: nexus-arcana_default
 
 volumes:
   qdrant_storage:
