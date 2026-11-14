@@ -134,6 +134,15 @@ def _tag(chat_id: int) -> str:
 def _fmt_tokens(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
+
+def response_text(message) -> str:
+    """Склеивает только text-блоки ответа. У моделей с thinking первым блоком
+    может идти ThinkingBlock без .text."""
+    return "".join(
+        b.text for b in message.content if getattr(b, "type", "") == "text"
+    )
+
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 conversations: dict[int, list[dict]] = {}
@@ -778,7 +787,7 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
-        summary = response.content[0].text
+        summary = response_text(response)
         add_usage(chat_id, SUMMARY_MODEL, response.usage)
     except Exception as e:
         logger.error(f"summarize error: {e}")
@@ -830,10 +839,27 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             messages=build_messages(history, canon),
         ) as stream:
             final = stream.get_final_message()
-        assistant_text = final.content[0].text
+        assistant_text = response_text(final)
+        add_usage(chat_id, model, final.usage)
+
+        if not assistant_text.strip():
+            # Пустой текст при stop_reason=max_tokens значит, что бюджет ушёл
+            # на размышления. В history не пишем, reply_text('') не зовём.
+            u = usage_bucket(final.usage)
+            logger.warning(
+                f"{tag} ⚠️ empty response: stop_reason={final.stop_reason}, usage={u}"
+            )
+            await send_log(
+                f"⚠️ klgpff empty response: stop_reason={final.stop_reason} "
+                f"usage={u} model={model}"
+            )
+            await update.message.reply_text(
+                f"пустой ответ (stop_reason={final.stop_reason})"
+            )
+            return
+
         history.append({"role": "assistant", "content": assistant_text})
         conversations[chat_id] = trim_history(history)
-        add_usage(chat_id, model, final.usage)
 
         chunks = split_by_paragraphs(assistant_text)
         for chunk in chunks:
@@ -887,7 +913,7 @@ async def classify_message(chat_id: int, user_text: str) -> str:
             messages=[{"role": "user", "content": user_text}],
         )
         add_usage(chat_id, CLASSIFIER_MODEL, response.usage)
-        result = response.content[0].text.strip().lower()
+        result = response_text(response).strip().lower()
         for alias in ("opus", "sonnet", "haiku"):
             if alias in result:
                 return alias
