@@ -122,3 +122,29 @@ def search_facts(user_id: int, query: str, top_k: int = 10) -> list:
         limit=top_k,
     )
     return [p.payload["fact_text"] for p in response.points if p.payload]
+
+
+def search_facts_multi(user_id: int, queries: list, top_k: int = 30, limit: int = 50) -> list:
+    """Поиск сразу по нескольким запросам (один батч эмбеддингов). Берёт top_k на
+    каждый запрос, склеивает без дублей, оставляет `limit` самых близких и
+    возвращает их в авторском порядке (по fact_index) — так канон читается как
+    написан, а не вперемешку."""
+    qc, _ = _ensure_clients()
+    vecs = _embed(list(queries), "query")
+    best = {}  # fact_index -> (score, text)
+    for vec in vecs:
+        response = qc.query_points(
+            collection_name=COLLECTION,
+            query=vec,
+            query_filter=_user_filter(user_id),
+            limit=top_k,
+        )
+        for p in response.points:
+            if not p.payload:
+                continue
+            idx = p.payload.get("fact_index", -1)
+            prev = best.get(idx)
+            if prev is None or p.score > prev[0]:
+                best[idx] = (p.score, p.payload["fact_text"])
+    top = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)[:limit]
+    return [text for _, (_, text) in sorted(top, key=lambda kv: kv[0])]

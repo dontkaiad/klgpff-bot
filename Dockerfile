@@ -8,6 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 
 # Data dirs — mounted as volumes at runtime
-RUN mkdir -p facts prompts models outputs
+RUN mkdir -p facts prompts models
 
 CMD ["python", "claude_tg_bot.py"]

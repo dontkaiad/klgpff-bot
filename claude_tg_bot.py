@@ -13,7 +13,6 @@ import json
 import os
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 
 
@@ -48,16 +47,28 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")  # для RAG (rag.py)
-DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "25"))
+DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
+# История режется пачками, а не по одному сообщению: при скользящем окне префикс
+# менялся бы на каждом ходу и prompt cache не попадал бы никогда. Дошли до
+# MAX_HISTORY пар → оставляем HISTORY_KEEP последних пар и дальше растём заново.
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "8"))
+HISTORY_KEEP = int(os.environ.get("HISTORY_KEEP", "4"))
+# TTL prompt cache: "5m" или "1h". При паузах между ходами >5 мин (читаешь сцену,
+# пишешь правку) 1h выгоднее: запись дороже, но кеш не протухает.
+CACHE_TTL = os.environ.get("CACHE_TTL", "1h")
+# RAG: сколько фактов тянуть на один запрос и сколько отдать в промпт максимум.
+RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "30"))
+RAG_MAX_FACTS = int(os.environ.get("RAG_MAX_FACTS", "50"))
+# Пока фактов не больше этого порога — отдаём все без поиска (0 = RAG всегда).
+FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "0"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
 # менять версию модели без правки кода.
 MODELS = {
-    "opus": os.environ.get("MODEL_OPUS", "claude-opus-4-8"),
-    "sonnet": os.environ.get("MODEL_SONNET", "claude-sonnet-4-6"),
-    "haiku": os.environ.get("MODEL_HAIKU", "claude-haiku-4-5"),
+    "opus": os.environ.get("MODEL_OPUS", "claude-opus-5-5"),
+    "sonnet": os.environ.get("MODEL_SONNET", "claude-sonnet-5-5"),
+    "haiku": os.environ.get("MODEL_HAIKU", "claude-haiku-5-5"),
 }
 SUMMARY_MODEL = MODELS["haiku"]
 CLASSIFIER_MODEL = MODELS["haiku"]
@@ -66,9 +77,11 @@ CLASSIFIER_MODEL = MODELS["haiku"]
 # Ключи — алиасы (opus/sonnet/haiku), а не ID: при смене версии в .env
 # цены не отвалятся.
 PRICING = {
-    "opus": {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
-    "sonnet": {"in": 3.0, "out": 15.0, "cw": 3.75, "cr": 0.30},
-    "haiku": {"in": 0.80, "out": 4.0, "cw": 1.0, "cr": 0.08},
+    # Цена записи в кеш считается из "in" (1.25x для 5m, 2x для 1h) в cost_for_model.
+    # Opus 5.5: cache read = 5% от input. Sonnet/Haiku — сверить на pricing-странице.
+    "opus": {"in": 4.0, "out": 20.0, "cw": 5.0, "cr": 0.20},
+    "sonnet": {"in": 2.0, "out": 10.0, "cw": 2.5, "cr": 0.20},
+    "haiku": {"in": 0.10, "out": 0.50, "cw": 0.125, "cr": 0.01},
 }
 
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")
@@ -94,15 +107,13 @@ FACTS_DIR = BASE_DIR / "facts"
 PROMPTS_DIR = BASE_DIR / "prompts"
 MODELS_DIR = BASE_DIR / "models"
 USAGE_DIR = BASE_DIR / "usage"
-OUTPUTS_DIR = BASE_DIR / "outputs"
 # Бэкапы фактов живут ВНЕ facts/, в отдельном volume — чтобы reset/пересборка
 # рабочей папки facts/ не уносила единственную копию (источник правды — сервер).
 FACTS_BACKUP_DIR = BASE_DIR / "backups" / "facts"
-for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR, OUTPUTS_DIR):
+for d in (FACTS_DIR, PROMPTS_DIR, MODELS_DIR, USAGE_DIR):
     d.mkdir(exist_ok=True)
 FACTS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-LONG_REPLY_THRESHOLD = 1500
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -196,19 +207,37 @@ def reindex_user_facts(user_id: int):
         logger.warning(f"RAG reindex skipped for user {user_id}: {e}")
 
 
-def get_relevant_facts(user_id: int, query: str):
-    """RAG-поиск релевантных query фактов. Возвращает (facts, source), где
-    source — человекочитаемое описание источника для лога. Fallback на все
-    факты: при недоступности Qdrant, пустом query или ненаполненном индексе."""
+def retrieval_queries(history: list[dict]) -> list[str]:
+    """Два запроса вместо одного. Просьба вроде «перепиши» или «ещё» сама по
+    себе ни на какие факты не похожа, поэтому второй запрос — контекст: прошлые
+    реплики юзера и начало последнего ответа (там уже названы герои и место)."""
+    users = [m["content"] for m in history if m["role"] == "user"]
+    current = users[-1][:1500] if users else ""
+    prev_assistant = next(
+        (m["content"] for m in reversed(history) if m["role"] == "assistant"), ""
+    )
+    context = "\n\n".join(users[-3:-1] + ([prev_assistant[:800]] if prev_assistant else []))
+    return [q for q in (current, context[:2000]) if q.strip()]
+
+
+def get_relevant_facts(user_id: int, history: list[dict]):
+    """Факты для текущего запроса. Возвращает (facts, source), где source —
+    человекочитаемое описание источника для лога. Fallback на все факты:
+    при недоступности Qdrant, пустом запросе или ненаполненном индексе."""
     all_facts = load_facts(user_id)
     if not all_facts:
         return [], "no facts stored"
-    if not query:
+    if FACTS_FULL_LIMIT and len(all_facts) <= FACTS_FULL_LIMIT:
+        return all_facts, f"all (<= {FACTS_FULL_LIMIT})"
+    queries = retrieval_queries(history)
+    if not queries:
         return all_facts, "all (no query)"
     try:
-        hits = rag.search_facts(user_id, query)
+        hits = rag.search_facts_multi(
+            user_id, queries, top_k=RAG_TOP_K, limit=RAG_MAX_FACTS
+        )
         if hits:
-            return hits, "semantic"
+            return hits, f"semantic ({len(queries)} queries)"
         # Qdrant доступен, но факты ещё не проиндексированы (напр. первый
         # запуск после деплоя) — наполняем индекс и используем все факты.
         reindex_user_facts(user_id)
@@ -238,20 +267,52 @@ def save_prompt(chat_id: int, prompt: str):
     prompt_path(chat_id).write_text(prompt, encoding="utf-8")
 
 
-def build_system_prompt(base_prompt: str, facts: list[str]) -> str:
+def build_canon_block(facts: list[str]) -> str:
+    """Канон для текущего запроса. Идёт в хвост последнего user-сообщения, а не
+    в system: system и история остаются стабильным префиксом для prompt cache,
+    а факты (меняются от запроса к запросу) стоят рядом с самой просьбой."""
     if not facts:
-        return base_prompt
+        return ""
     facts_block = "\n".join(f"- {f}" for f in facts)
     return (
-        f"{base_prompt}\n\n"
-        f"## Канон персонажей и мира (обязателен к соблюдению)\n"
-        f"Все пункты ниже — установленный канон. Любая написанная сцена должна "
-        f"соответствовать им: ни один факт не должен быть нарушен, а все "
-        f"релевантные сцене факты должны быть отражены в повествовании.\n\n"
-        f"{facts_block}\n\n"
-        f"Вплетай эти детали в текст естественно — не выводи их списком и не "
-        f"называй внутри сцены «фактами» или «каноном»."
+        "<canon>\n"
+        "Канон персонажей и мира — обязателен к соблюдению. Любая написанная "
+        "сцена должна соответствовать ему: ни один факт не должен быть нарушен, "
+        "а все релевантные сцене факты должны быть отражены в повествовании. "
+        "Если канон не покрывает деталь — не выдумывай противоречащую ему.\n\n"
+        f"{facts_block}\n"
+        "</canon>\n\n"
+        "Вплетай эти детали в текст естественно — не выводи их списком и не "
+        "называй внутри сцены «фактами» или «каноном»."
     )
+
+
+def build_messages(history: list[dict], canon: str) -> list[dict]:
+    """Копия истории для API: канон дописан к последнему user-сообщению, а на
+    последнем ответе ассистента стоит cache-breakpoint (кешируется всё до него).
+    Сама история в памяти остаётся чистой — канон в неё не пишется."""
+    msgs = [dict(m) for m in history]
+    if not msgs:
+        return msgs
+    last = msgs[-1]
+    if last["role"] == "user":
+        text = last["content"] if isinstance(last["content"], str) else ""
+        if canon:
+            text = f"{text}\n\n{canon}"
+        last["content"] = text
+    if len(msgs) >= 2 and msgs[-2]["role"] == "assistant":
+        prev = msgs[-2]
+        msgs[-2] = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prev["content"],
+                    "cache_control": cache_control(),
+                }
+            ],
+        }
+    return msgs
 
 
 # --- Модели ---
@@ -293,6 +354,9 @@ LEGACY_MODEL_ALIASES = {
     "claude-opus-4-20250514": "opus",
     "claude-sonnet-4-20250514": "sonnet",
     "claude-haiku-4-5-20251001": "haiku",
+    "claude-opus-4-8": "opus",
+    "claude-sonnet-4-6": "sonnet",
+    "claude-haiku-4-5": "haiku",
 }
 
 
@@ -356,10 +420,12 @@ def cost_for_model(model: str, b: dict) -> float:
     p = PRICING.get(model_alias(model))
     if not p:
         return 0.0
+    # запись в кеш: 1.25x input для TTL 5m, 2x input для TTL 1h
+    cw = p["in"] * (2.0 if CACHE_TTL == "1h" else 1.25)
     return (
         b["input"] * p["in"]
         + b["output"] * p["out"]
-        + b["cache_write"] * p["cw"]
+        + b["cache_write"] * cw
         + b["cache_read"] * p["cr"]
     ) / 1_000_000
 
@@ -399,20 +465,28 @@ def get_history(chat_id: int) -> list[dict]:
 def trim_history(history: list[dict]) -> list[dict]:
     max_messages = MAX_HISTORY * 2
     if len(history) > max_messages:
-        history = history[-max_messages:]
+        history = history[-(HISTORY_KEEP * 2):]
     # Anthropic API requires the first message to be from the user.
     while history and history[0]["role"] != "user":
         history = history[1:]
     return history
 
 
+def cache_control() -> dict:
+    cc = {"type": "ephemeral"}
+    if CACHE_TTL == "1h":
+        cc["ttl"] = "1h"
+    return cc
+
+
 def system_block(text: str) -> list[dict]:
-    """system как блок с cache_control — Anthropic кеширует на 5 минут."""
+    """system как блок с cache_control. Он статичный (без фактов), поэтому
+    кеш попадает на каждом ходу."""
     return [
         {
             "type": "text",
             "text": text,
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": cache_control(),
         }
     ]
 
@@ -421,10 +495,10 @@ def system_block(text: str) -> list[dict]:
 HELP_TEXT = (
     "📝 диалог:\n"
     "/new — новый диалог (сбросить контекст)\n"
-    "/scene <описание> — длинная сцена через opus (1500+ слов, файл)\n"
+    "/scene <описание> — длинная сцена через opus (1500+ слов)\n"
     "/regenerate [правка] — перегенерить последний ответ (с опц. правкой)\n"
     "/summarize — сжать историю через haiku, чтобы экономить токены\n"
-    "/last — последний сохранённый файл\n\n"
+    "\n"
     "🧠 память (сохраняется между сессиями):\n"
     "/remember <факт> — запомнить\n"
     "/forget <номер> — забыть по номеру\n"
@@ -443,10 +517,9 @@ HELP_TEXT = (
 
 BOT_COMMANDS = [
     ("new", "новый диалог (сбросить контекст)"),
-    ("scene", "длинная сцена через opus (1500+ слов, файл)"),
+    ("scene", "длинная сцена через opus (1500+ слов)"),
     ("regenerate", "перегенерить последний ответ (можно с правкой)"),
     ("summarize", "сжать историю через haiku"),
-    ("last", "последний сохранённый файл"),
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
     ("facts", "показать все факты"),
@@ -647,49 +720,6 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _generate_and_reply(update, chat_id, user_id, history)
 
 
-async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    chat_id = update.effective_chat.id
-    chat_dir = OUTPUTS_DIR / str(chat_id)
-    files = sorted(chat_dir.glob("*.txt")) if chat_dir.exists() else []
-    if not files:
-        await update.message.reply_text("сохранённых файлов нет.")
-        return
-    last = files[-1]
-    with last.open("rb") as f:
-        await update.message.reply_document(document=f, filename=last.name)
-
-
-async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    desc = update.message.text.partition(" ")[2].strip()
-    if not desc:
-        await update.message.reply_text(
-            "напиши описание после /scene\n"
-            "пример: /scene первая встреча героев в портовом городе"
-        )
-        return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    wrapped = (
-        "Напиши длинную атмосферную сцену. Используй все факты о персонажах. "
-        f"Минимум 1500 слов. Описание сцены: {desc}"
-    )
-    history = get_history(chat_id)
-    history.append({"role": "user", "content": wrapped})
-    history = trim_history(history)
-    conversations[chat_id] = history
-
-    tag = _tag(chat_id)
-    logger.info(f'{tag} 📩 /scene "{desc[:80]}"')
-    logger.info(f"{tag} 📌 scene → opus ({MODELS['opus']})")
-    await _generate_and_reply(
-        update, chat_id, user_id, history, model_override=MODELS["opus"]
-    )
-
-
 async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -738,25 +768,13 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
-def save_output(chat_id: int, text: str) -> Path:
-    chat_dir = OUTPUTS_DIR / str(chat_id)
-    chat_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = chat_dir / f"{ts}.txt"
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
     tag = _tag(chat_id)
     base_prompt = load_prompt(chat_id)
-    last_user_msg = next(
-        (m["content"] for m in reversed(history) if m["role"] == "user"), ""
-    )
-    facts, fact_source = get_relevant_facts(user_id, last_user_msg)
-    system_prompt = build_system_prompt(base_prompt, facts)
+    facts, fact_source = get_relevant_facts(user_id, history)
+    canon = build_canon_block(facts)
     model = model_override or load_model(chat_id)
-    facts_chars = len(system_prompt) - len(base_prompt)
+    facts_chars = len(canon)
 
     logger.info(f"{tag} 🔍 RAG: {len(facts)} facts ({fact_source})")
     # get_relevant_facts() гасит исключение Qdrant внутри (sync, без await) и
@@ -766,8 +784,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             f"⚠️ klgpff RAG fallback: Qdrant unavailable ({len(facts)} facts used)"
         )
     logger.info(
-        f"{tag} 🧠 prompt: {len(system_prompt)} chars "
-        f"(base {len(base_prompt)} + facts {facts_chars}), history {len(history)} msgs"
+        f"{tag} 🧠 prompt: system {len(base_prompt)} chars + canon {facts_chars} chars, "
+        f"history {len(history)} msgs"
     )
     logger.info(f"{tag} ✍️ generating...")
 
@@ -779,8 +797,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         with client.messages.stream(
             model=model,
             max_tokens=MAX_TOKENS,
-            system=system_block(system_prompt),
-            messages=history,
+            system=system_block(base_prompt),
+            messages=build_messages(history, canon),
         ) as stream:
             final = stream.get_final_message()
         assistant_text = final.content[0].text
@@ -792,21 +810,12 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         for chunk in chunks:
             await update.message.reply_text(chunk)
 
-        saved_file = len(assistant_text) > LONG_REPLY_THRESHOLD
-        if saved_file:
-            path = save_output(chat_id, assistant_text)
-            with path.open("rb") as f:
-                await update.message.reply_document(
-                    document=f, filename=path.name
-                )
-
         u = usage_bucket(final.usage)
         alias = model_alias(model) or model
         req_cost = cost_for_model(model, u)
-        file_part = " + file" if saved_file else ""
         logger.info(
             f"{tag} ✅ done: {len(assistant_text)} chars → "
-            f"{len(chunks)} messages{file_part} | "
+            f"{len(chunks)} messages | "
             f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out | "
             f"${req_cost:.2f}"
         )
@@ -999,7 +1008,6 @@ def main():
     app.add_handler(CommandHandler("regenerate", cmd_regenerate))
     app.add_handler(CommandHandler("summarize", cmd_summarize))
     app.add_handler(CommandHandler("scene", cmd_scene))
-    app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

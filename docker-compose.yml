@@ -9,7 +9,6 @@ services:
       - ./facts:/app/facts
       - ./prompts:/app/prompts
       - ./models:/app/models
-      - ./outputs:/app/outputs
       - ./backups:/app/backups
     # $$ — экранирование для Compose: в раннер уходит литеральный $, healthcheck
     # сравнивает свежесть /tmp/heartbeat (now - mtimestamp < 90с).
