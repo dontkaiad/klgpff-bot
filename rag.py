@@ -114,22 +114,26 @@ def index_facts(user_id: int, facts: list) -> None:
 
 
 def search_facts_multi(
-    user_id: int, queries: list, top_k: int = 30, limit: int = 50
+    user_id: int, queries: list, top_k: int = 30, limit: int = 50, exclude=None
 ) -> list:
     """Поиск сразу по нескольким запросам (один батч эмбеддингов). Берёт top_k на
     каждый запрос, склеивает без дублей, оставляет `limit` самых близких и
     возвращает их в авторском порядке (по fact_index) — так канон читается как
-    написан, а не вперемешку."""
+    написан, а не вперемешку.
+
+    exclude: fact_index, которые не искать (закреплённые факты бот добавляет в
+    выдачу сам, они не должны занимать места в top_k и limit)."""
     vecs = _embed(list(queries), "query")
+    excl = sorted(set(exclude)) if exclude else []
     best = {}  # fact_index -> (score, text)
     with _connect() as conn:
         for vec in vecs:
             qv = _vec(vec)
             rows = conn.execute(
                 "SELECT fact_index, fact_text, 1 - (embedding <=> %s::vector) AS score "
-                "FROM facts WHERE user_id = %s "
+                "FROM facts WHERE user_id = %s AND NOT (fact_index = ANY(%s::int[])) "
                 "ORDER BY embedding <=> %s::vector LIMIT %s",
-                (qv, user_id, qv, top_k),
+                (qv, user_id, excl, qv, top_k),
             ).fetchall()
             for idx, text, score in rows:
                 prev = best.get(idx)

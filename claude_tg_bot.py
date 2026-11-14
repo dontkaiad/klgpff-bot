@@ -173,6 +173,25 @@ def load_facts(user_id: int) -> list[str]:
     return _read_facts_file(facts_path(user_id))
 
 
+# Закреплённый факт начинается с маркера ("📌 у героини шрам"). Он попадает в
+# выдачу всегда, когда включён поиск, и не занимает места в RAG_MAX_FACTS.
+# Маркер служебный: в канон и в текст для эмбеддинга уходит факт без него.
+PIN_MARK = "📌"
+PINNED_WARN = 40  # больше закреплённых: канон раздувается мимо RAG_MAX_FACTS
+
+
+def is_pinned(fact: str) -> bool:
+    return fact.lstrip().startswith(PIN_MARK)
+
+
+def strip_pin(fact: str) -> str:
+    """Факт без маркера (и без variation selector/пробелов после него)."""
+    s = fact.lstrip()
+    if s.startswith(PIN_MARK):
+        s = s[len(PIN_MARK):].lstrip("️ \t")
+    return s
+
+
 def _dump_facts(facts: list[str]) -> str:
     return json.dumps(facts, ensure_ascii=False, indent=2)
 
@@ -205,7 +224,7 @@ def restore_facts_from_backups():
             f"[user {user_id}] ♻️ facts restored from backup ({len(backup_facts)} facts)"
         )
         try:
-            rag.index_facts(user_id, backup_facts)
+            rag.index_facts(user_id, [strip_pin(f) for f in backup_facts])
         except Exception as e:
             logger.warning(f"RAG reindex after restore skipped for user {user_id}: {e}")
 
@@ -213,7 +232,7 @@ def restore_facts_from_backups():
 def reindex_user_facts(user_id: int):
     """Переиндексирует факты юзера в pgvector. Тихо логирует при недоступности RAG."""
     try:
-        rag.index_facts(user_id, load_facts(user_id))
+        rag.index_facts(user_id, [strip_pin(f) for f in load_facts(user_id)])
     except Exception as e:
         logger.warning(f"RAG reindex skipped for user {user_id}: {e}")
 
@@ -235,20 +254,45 @@ def get_relevant_facts(user_id: int, history: list[dict]):
     """Факты для текущего запроса. Возвращает (facts, source), где source —
     человекочитаемое описание источника для лога. Fallback на все факты:
     при недоступности БД с векторами, пустом запросе или ненаполненном индексе."""
-    all_facts = load_facts(user_id)
-    if not all_facts:
+    raw = load_facts(user_id)
+    if not raw:
         return [], "no facts stored"
+    all_facts = [strip_pin(f) for f in raw]  # маркер 📌 дальше не идёт никуда
     if FACTS_FULL_LIMIT and len(all_facts) <= FACTS_FULL_LIMIT:
         return all_facts, f"all (<= {FACTS_FULL_LIMIT})"
+    # Поиск включён. Закреплённые идут первыми в авторском порядке и не считаются
+    # в RAG_MAX_FACTS: их исключаем из поиска по индексу, а не вычитаем потом.
+    pinned_idx = [i for i, f in enumerate(raw) if is_pinned(f)]
+    pinned = [all_facts[i] for i in pinned_idx]
+    if len(pinned) > PINNED_WARN:
+        logger.warning(
+            f"[user {user_id}] закреплённых фактов {len(pinned)} (> {PINNED_WARN}): "
+            f"канон растёт мимо RAG_MAX_FACTS"
+        )
     queries = retrieval_queries(history)
     if not queries:
         return all_facts, "all (no query)"
+    if len(pinned) == len(raw):
+        return pinned, "all pinned"
     try:
         hits = rag.search_facts_multi(
-            user_id, queries, top_k=RAG_TOP_K, limit=RAG_MAX_FACTS
+            user_id,
+            queries,
+            top_k=RAG_TOP_K,
+            limit=RAG_MAX_FACTS,
+            exclude=set(pinned_idx),
         )
         if hits:
-            return hits, f"semantic ({len(queries)} queries)"
+            # Индекс мог устареть после ручной правки файла: чистим маркер и
+            # убираем дубли с закреплёнными по тексту.
+            seen = set(pinned)
+            extra = []
+            for h in (strip_pin(x) for x in hits):
+                if h not in seen:
+                    seen.add(h)
+                    extra.append(h)
+            suffix = f" + {len(pinned)} pinned" if pinned else ""
+            return pinned + extra, f"semantic ({len(queries)} queries){suffix}"
         # БД доступна, но факты ещё не проиндексированы (напр. первый
         # запуск после деплоя) — наполняем индекс и используем все факты.
         reindex_user_facts(user_id)
@@ -512,7 +556,7 @@ HELP_TEXT = (
     "/summarize — сжать историю через haiku, чтобы экономить токены\n"
     "\n"
     "🧠 память (сохраняется между сессиями):\n"
-    "/remember <факт> — запомнить\n"
+    "/remember <факт> — запомнить (📌 в начале закрепляет: факт всегда в промпте)\n"
     "/forget <номер> — забыть по номеру\n"
     "/forget all — забыть всё\n"
     "/facts — все факты\n\n"
