@@ -871,7 +871,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         logger.info(
             f"{tag} ✅ done: {len(assistant_text)} chars → "
             f"{len(chunks)} messages | "
-            f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out | "
+            f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out / "
+            f"cache r {u['cache_read']} w {u['cache_write']} | "
             f"${req_cost:.2f}"
         )
     except anthropic.APIError as e:
