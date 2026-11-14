@@ -9,6 +9,8 @@ prompts/
 models/
 usage/
 outputs/
+eval_runs/
+evals/cases.local.jsonl
 backups/
 *.json
 *.pkl

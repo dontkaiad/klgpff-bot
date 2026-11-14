@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
+COPY evals ./evals
 
 # Data dirs — mounted as volumes at runtime
 RUN mkdir -p facts prompts models

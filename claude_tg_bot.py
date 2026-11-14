@@ -78,9 +78,11 @@ CLASSIFIER_MODEL = MODELS["haiku"]
 # цены не отвалятся.
 PRICING = {
     # Цена записи в кеш считается из "in" (1.25x для 5m, 2x для 1h) в cost_for_model.
-    # Opus 5.5: cache read = 5% от input. Sonnet/Haiku — сверить на pricing-странице.
+    # Сверено с pricing-страницей Anthropic, ноябрь 2026: Opus 5.5 cache read $0.20,
+    # Sonnet 5.5 $0.10 (снижен с $0.20 в октябре), Haiku 5.5 $0.01 при промпте до 100K
+    # токенов (дороже в 5 раз выше этого порога, нашего размера это не касается).
     "opus": {"in": 4.0, "out": 20.0, "cw": 5.0, "cr": 0.20},
-    "sonnet": {"in": 2.0, "out": 10.0, "cw": 2.5, "cr": 0.20},
+    "sonnet": {"in": 2.0, "out": 10.0, "cw": 2.5, "cr": 0.10},
     "haiku": {"in": 0.10, "out": 0.50, "cw": 0.125, "cr": 0.01},
 }
 
