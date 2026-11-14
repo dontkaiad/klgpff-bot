@@ -1,107 +1,83 @@
-# klgpff — Kai Lark's Guilty Pleasure Fanfiction Bot
+# klgpff
 
-Telegram bot for literary prose and explicit fanfiction via the Anthropic Claude API directly — no claude.ai filters. With character-fact memory, smart model routing, prompt caching and cost tracking.
+Telegram-бот для длинной художественной прозы. Ходит в Anthropic API напрямую, держит канон персонажей и мира (факты) и подмешивает его в каждый запрос, считает расходы. Один автор, доступ по белому списку Telegram ID.
 
-## Features
+## Что делает
 
-- Writes long atmospheric scenes via the Claude API directly
-- **Smart router** powered by a Haiku classifier: new scenes → Opus, edits/continuations → Sonnet, chat → Haiku. Manual override available.
-- **Prompt caching** — system+facts use `cache_control: ephemeral`, repeat turns within 5 min pay 10% of normal input cost
-- **Token & cost accounting** per chat: `/cost` reports per-model usage broken down into input / output / cache
-- **Auto-save** for replies over 1500 chars to `outputs/<chat>/<timestamp>.txt`, also sent as a Telegram document
-- Character-fact memory on disk — survives restarts
-- Per-chat system prompt: set, extend, persists across restarts
-- History compression (`/summarize`) via Haiku — slashes input cost on long sessions
-- User whitelist by Telegram ID
+- Пишет сцены через Opus 5.5. Это режим по умолчанию. Роутер на Haiku, который выбирает модель под запрос, включается командой `/model auto`.
+- Канон. Пока фактов не больше `FACTS_FULL_LIMIT` (150), в запрос идут все. Выше лимита включается поиск по pgvector. Сейчас фактов 132, поэтому поиск в проде не работает.
+- Prompt cache: статичный system, история с точкой кеширования на последнем ответе, канон в хвосте последнего сообщения пользователя. TTL 1 час.
+- Учёт расходов по чату: `/cost` показывает input, output, cache read и write по каждой модели.
+- Сжатие истории `/summarize` через Haiku.
+- Системный промпт у каждого чата свой, переживает перезапуск.
+- Текстовый файл, присланный документом, обрабатывается как обычное сообщение (подпись, если есть, идёт в начало).
 
-## Commands
+Чего больше нет: сохранения длинных ответов в `outputs/` и отправки их файлом, команды `/last`. Ответ длиннее 4096 символов режется по абзацам на несколько сообщений.
 
-| Command | Description |
+## Команды
+
+| Команда | Что делает |
 |---|---|
-| `/new` | Reset conversation context |
-| `/scene <desc>` | Long scene via Opus (1500+ words, file) |
-| `/regenerate [edit]` | Regenerate last reply (optional inline correction) |
-| `/summarize` | Compress history via Haiku |
-| `/last` | Last saved file |
-| `/remember <fact>` | Save a character fact |
-| `/forget <n>` | Forget fact by number |
-| `/forget all` | Forget all facts |
-| `/facts` | Show all facts |
-| `/system` | Show current system prompt |
-| `/setsystem <text>` | Replace system prompt |
-| `/addprompt <text>` | Append to current prompt |
-| `/model` | Current mode |
-| `/model auto` | Classifier decides (default) |
-| `/model opus\|sonnet\|haiku` | Pin model, classifier off |
-| `/cost` | Costs for this chat |
-| `/help` | Command list |
+| `/new` | Сбросить контекст диалога (факты остаются) |
+| `/scene <описание>` | Длинная сцена на Opus, от 1500 слов, независимо от режима |
+| `/regenerate [правка]` | Перегенерировать последний ответ, можно с правкой |
+| `/summarize` | Сжать историю через Haiku |
+| `/remember <факт>` | Запомнить факт |
+| `/forget <номер>` | Забыть факт по номеру |
+| `/forget all` | Забыть все факты |
+| `/facts` | Показать все факты |
+| `/system` | Показать системный промпт |
+| `/setsystem <текст>` | Заменить системный промпт (контекст сбрасывается) |
+| `/addprompt <текст>` | Дописать к системному промпту |
+| `/model` | Показать режим |
+| `/model opus\|sonnet\|haiku` | Закрепить модель, роутер выключен (по умолчанию opus) |
+| `/model auto` | Модель выбирает роутер |
+| `/cost` | Расходы по этому чату |
+| `/help` | Список команд |
 
-## Install
+## Запуск
+
+Сервер: Docker Compose. Образ `python:3.11-slim`, бот подключён к docker-сети контейнера Postgres. Переменные окружения описаны в `.env.example`.
 
 ```bash
-pip install python-telegram-bot anthropic
+cp .env.example .env   # заполнить токены и DATABASE_URL
+docker compose up -d --build klgpff-bot
 ```
 
-Create `.env` next to the script:
+Локально: `pip install -r requirements.txt` и `python claude_tg_bot.py`. Поиск по фактам требует Postgres с расширением `vector` и ключ Voyage. Без них бот работает, но отдаёт в промпт все факты. Скрипты в `evals/` требуют Python 3.10 или новее.
 
-```
-TELEGRAM_BOT_TOKEN=your_botfather_token
-ANTHROPIC_API_KEY=sk-ant-...
-ALLOWED_USERS=your_telegram_id
-CLAUDE_MODEL=claude-opus-4-8     # default when mode is auto
-MAX_HISTORY=25                           # turns kept in context
-MAX_TOKENS=8000                          # max_tokens for generation
-```
+Деплой: GitHub Actions по пушу в `main` заходит на сервер по SSH, делает `git pull` и `docker compose up -d --build klgpff-bot`. Healthcheck считает бота живым, пока файл `/tmp/heartbeat` обновлялся меньше 90 секунд назад.
 
-Run:
+## Хранение
 
-```bash
-python claude_tg_bot.py
-```
-
-## Storage layout
-
-| Folder | Contents |
+| Путь | Содержимое |
 |---|---|
-| `facts/<user_id>.json` | User-scoped facts |
-| `prompts/<chat_id>.txt` | Per-chat system prompt |
-| `models/<chat_id>.txt` | Model mode (auto/opus/sonnet/haiku) |
-| `usage/<chat_id>.json` | Token counters per model |
-| `outputs/<chat_id>/*.txt` | Auto-saved long replies |
+| `facts/<user_id>.json` | Факты пользователя, JSON-список строк |
+| `prompts/<chat_id>.txt` | Системный промпт чата |
+| `models/<chat_id>.txt` | Режим модели: opus, sonnet, haiku или auto |
+| `usage/<chat_id>.json` | Счётчики токенов по моделям |
+| `backups/facts/<user_id>.json` | Копия фактов, пишется при каждом изменении |
+| `backups/archive/` | Шифрованные архивы фактов и промптов |
+| `eval_runs/` | Результаты слепого теста моделей (приватно) |
 
-All of the above are in `.gitignore` — private content never leaks.
+Всё это в `.gitignore`. Векторный индекс фактов лежит в Postgres (таблица `facts` в базе `klgpff`) и пересоздаётся из `facts/<user_id>.json`. История диалога хранится только в памяти процесса: после перезапуска контекст пустой.
 
-## Requirements
+## Бэкапы
 
-- Python 3.9+
-- Anthropic API key
-- Telegram bot token (from [@BotFather](https://t.me/BotFather))
+Факты это единственное, что автор пишет руками, поэтому они защищены двумя способами.
 
-## Backups
+- Зеркало. Каждый `/remember` и `/forget` пишет `facts/<id>.json` и копию в `backups/facts/<id>.json` (отдельный volume). При старте, если рабочий файл отсутствует или пуст, а копия непустая, бот восстанавливает файл и переиндексирует факты в pgvector. Это переживает `git reset --hard` и пересоздание volume `facts/`.
+- Шифрованный архив. `scripts/backup_facts.sh` пакует `facts/` и `prompts/` в tar.gz, шифрует через `gpg` (симметрично, AES256, пароль из `BACKUP_PASSPHRASE`), кладёт в `backups/archive/facts-<время>.tar.gz.gpg` и оставляет 14 последних. На сервере запускается из cron ежедневно, пример строки crontab в шапке скрипта. Нужен `gpg` на хосте.
 
-Facts are the only user-authored state, so they're protected two ways:
-
-- **Instant mirror.** Every `/remember` / `/forget` writes `facts/<id>.json` and a copy under `backups/facts/<id>.json` (a separate volume). On startup, if a working facts file is missing or empty but a non-empty backup exists, the bot restores it and re-indexes into pgvector (`♻️ facts restored from backup`). This survives a `git reset --hard` or container rebuild of the `facts/` volume.
-- **Periodic encrypted archive.** `scripts/backup_facts.sh` tars `facts/` + `prompts/`, encrypts with `gpg` (symmetric, AES256, passphrase from `BACKUP_PASSPHRASE`), and writes `backups/archive/facts-<timestamp>.tar.gz.gpg`, keeping the 14 newest. Run it daily on the server via cron (example crontab line is in the script header). Requires `gpg` installed on the host.
-
-**Restore from an encrypted archive:**
+Восстановление из архива:
 
 ```bash
 gpg -d backups/archive/facts-YYYYMMDD-HHMMSS.tar.gz.gpg | tar -xzf -
 ```
 
-This recreates `facts/` and `prompts/` in the current directory. (Older `gpg` may need `gpg -d --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" ...`.)
+Команда создаёт `facts/` и `prompts/` в текущем каталоге. На старых версиях `gpg` может понадобиться `gpg -d --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" ...`.
 
-## ⚙️ Engineering highlights
+## Подробнее
 
-- **Cost-aware model routing** — a Haiku classifier picks Opus / Sonnet / Haiku per task, so expensive models run only where they earn it
-- **RAG character memory** — Voyage embeddings + Postgres/pgvector, semantic retrieval instead of context-stuffing
-- **Raw API over a managed platform** — full control of the system prompt, model selection, and generation params
-- **File-based persistence, streaming generation, graceful degradation** — small footprint, debuggable, falls back instead of failing
-- **Dockerized, auto-deployed** via GitHub Actions on push to `main`
-
-Full engineering writeup → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-
-## Why
-
-Because claude.ai filters explicit content, and fanfiction has to get written.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): как устроен пайплайн, кеш, поиск по фактам, роутер, цены, известные ограничения.
+- [docs/EVALS.md](docs/EVALS.md): слепой тест моделей, как запускать и что получилось.

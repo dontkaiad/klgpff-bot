@@ -1,232 +1,137 @@
-# Architecture — klgpff
+# Архитектура klgpff
 
-*Read time: ~8–10 min. Code conforms to: `ccfa8db`.*
+Описание кода, как он есть в репозитории. Цифры из прогонов и логов помечены датой. Что я не проверял, написано прямо.
 
-A Telegram-based assistant for long-form creative writing — an interactive fiction
-tool that holds character canon across sessions, routes each turn to the right model,
-and streams long scenes back as both chat and file.
+## Из чего состоит
 
-This document isn't a feature list (that's the [README](../README.md)). It's the
-reasoning. Why this shape, what I rejected, and what each choice cost me.
+Python 3.11, `python-telegram-bot` (polling), Anthropic SDK напрямую, Voyage для эмбеддингов, Postgres 16 с pgvector для поиска по фактам, остальное состояние в файлах. Один процесс, один контейнер. Postgres общий: контейнер `nexus-arcana-db`, у бота там своя база `klgpff` и своя роль. Бот подключён к docker-сети этого контейнера.
 
-## What this is
-
-This is a small, focused system, and that focus is the context for every decision
-below. It's a creative-writing tool, but it's also a deliberate proving ground for the
-part of the stack I actually care about: LLM engineering. Model routing, retrieval,
-resilient API plumbing, cost discipline — those are the problems I wanted to practice,
-and they show up here in the same shape they take at scale.
-
-So I held the bar where it'd be on a team. Dockerized, auto-deployed, persistence
-that survives restarts, graceful degradation when a dependency is down. The footprint
-is small; the discipline isn't — and discipline you only practice under load is
-discipline you don't have.
-
-## Decisions I'm proud of
-
-### 1. Raw Anthropic API over a managed platform
-
-**Context.** Long-form creative writing needs consistency the consumer surface
-doesn't expose: a stable system prompt, deterministic model selection, and direct
-control over generation params (`max_tokens`, streaming, caching). A managed
-platform hands you a chat box and decides the rest.
-
-**Choice.** I went straight to the **raw Anthropic API** and own the whole
-generation stack — system prompt, which model answers which turn, how long the
-output can run, what gets cached.
-
-**Alternatives rejected.** A managed consumer platform. It's faster to start with
-and gives you nothing where it matters: you can't pin the model per task, you can't
-shape the system prompt as canon, you can't tune `max_tokens` for a 3000-word scene.
-The abstraction is comfortable in exactly the places I needed it to be sharp.
-
-**Trade-off.** I now own things a platform would've handled — auth, retries,
-deprecations, cost accounting. That's more surface to maintain. I took it on
-deliberately: the maturity move isn't avoiding the lower layer, it's knowing *where*
-in the stack the control you need lives and choosing that altitude on purpose.
-
-*The right abstraction layer is the lowest one you actually understand.*
-
-### 2. Cost-aware model routing
-
-**Context.** Not every turn deserves the flagship model. "Continue this scene" and
-"what's her brother's name again?" cost the same under a naive setup, and that cost
-is Opus rates.
-
-**Choice.** A **Haiku classifier routes every turn** before generation: a new scene
-goes to Opus, an edit or continuation to Sonnet, and discussion or short meta-talk
-stays on Haiku. The classifier replies with a single token. There's a manual pin for
-when I want to override it.
-
-**Alternatives rejected.** Opus everywhere. Simpler, and 10–20× more expensive for no
-gain on the mechanical turns — a classification doesn't write better because a frontier
-model decided it. Routing pays for its own (cheap) inference many times over.
-
-**Trade-off.** The router can misroute, and a wrong call means a turn answered by a
-weaker model. I keep the classifier prompt tight and bilingual, default it to Haiku on
-any error, and let me pin manually — but it's a probabilistic component in a hot path,
-and I treat it like one.
-
-*A model you pay Opus rates to echo one token is a budget leak with good manners.*
-
-### 3. RAG over context-stuffing for character memory
-
-**Context.** Character and world facts accumulate. Stuffing all of them into every
-prompt inflates context, costs tokens on every turn, and — worse — buries the few
-facts that matter for *this* scene under all the ones that don't.
-
-**Choice.** Facts are **embedded (Voyage) and indexed in Postgres (pgvector)**, and each turn pulls
-the top-K semantically relevant to the current message instead of the whole pile. The
-model sees what's relevant, not everything.
-
-**Alternatives rejected.** Context-stuffing — every fact in every prompt. It's trivial
-to build and it scales badly in two directions at once: token cost climbs linearly with
-canon, and signal-to-noise drops, which is how you get a model contradicting an
-established detail it technically "had."
-
-**Trade-off.** Semantic retrieval can miss the one fact a scene needed. So retrieval
-isn't load-bearing in the failure case: if the database is unreachable, or the index hasn't
-been populated yet, the bot **falls back to the full fact list** and lazily backfills
-the index. Degraded, not broken.
-
-**Vector store.** pgvector in the existing Postgres rather than a dedicated vector
-database: at hundreds to thousands of facts an exact scan is fast and lossless (no ANN
-index, no recall trade-off), and it is one fewer service to run and back up.
-
-*The cheapest token is the one you never put in the prompt.*
-
-### 4. File-based persistence over a database
-
-**Context.** Facts, prompts, model modes, usage counters, saved outputs — all need to
-survive restarts. The total volume is tiny.
-
-**Choice.** **Flat files on disk**, mounted as Docker volumes. JSON for structured
-state, text for prompts and outputs. Legible, greppable, debuggable by `cat`.
-
-**Alternatives rejected.** A real database. It buys concurrent writes, query power, and
-migrations — none of which a tool with kilobytes of serially-written state needs. It'd
-be infrastructure carried for a scale this doesn't have.
-
-**Trade-off.** No concurrent-write safety and no rich queries. Honest cost, and at this
-volume the writes are serial and never contend. The day that changes, this is the first
-decision I revisit — and I'll know exactly why.
-
-*A database you don't need is just latency with a schema.*
-
-### 5. Model IDs in env, pricing keyed by alias
-
-**Context.** Model IDs change. Versions get deprecated and the dated IDs stop
-resolving.
-
-**Choice.** Concrete model IDs live in **`.env` (`MODEL_OPUS` / `MODEL_SONNET` /
-`MODEL_HAIKU`)**, and the pricing table is **keyed by alias** (`opus`/`sonnet`/`haiku`),
-not by ID. Bumping a model version is a one-line config change, and the cost math
-doesn't move with it.
-
-**Alternatives rejected.** Hardcoded IDs in the source — including the pricing table.
-That's what I had, and it failed exactly the way you'd predict: an Opus version was
-deprecated, every call started returning 404, and the fix had to be a code edit and a
-redeploy. Now it's a line in `.env`.
-
-**Trade-off.** A small layer of indirection — the alias↔ID mapping has to stay
-coherent, and usage logged under an old ID won't match the new pricing key. Cheap
-insurance against a failure mode I've already lived through once.
-
-*A hardcoded model ID is a deprecation notice with a delay.*
-
-### 6. Streaming generation
-
-**Context.** A long scene at a high `max_tokens` can take a while to generate, and the
-SDK refuses non-streaming requests that might exceed its 10-minute ceiling.
-
-**Choice.** The main generation path **streams** and assembles the final message from
-the stream. The short, bounded calls — the router, the summarizer — stay non-streaming,
-because they can't approach the limit and streaming would just be ceremony.
-
-**Alternatives rejected.** Capping `max_tokens` low enough to dodge the limit. That
-solves the wrong problem — it shortens the scenes to fit the transport, which is the one
-thing a long-form tool can't trade away.
-
-**Trade-off.** Streaming is more code on the hot path than a single blocking call. For
-the turns that are the entire point of the product, it's the only correct shape.
-
-*If the work can outlast the timeout, the connection has to outlast it too.*
-
-## How it's built
-
-```mermaid
-flowchart TD
-    U[Telegram message] --> R{{Haiku router<br/>classify turn}}
-    R -->|new scene| GEN
-    R -->|edit / continue| GEN
-    R -->|discussion| GEN
-    U -.fact context.-> RAG[RAG retrieval]
-    RAG --> VO[[Voyage embeddings]]
-    RAG --> QD[[pgvector top-K]]
-    RAG --> GEN[Streaming generation<br/>Opus / Sonnet / Haiku]
-    GEN --> AN[[Anthropic API]]
-    GEN --> OUT[Reply + file save]
-    OUT --> FS[(File persistence<br/>facts / prompts / usage / outputs)]
-    GEN -.token + cost accounting.-> FS
+```
+Telegram → handler
+         → режим модели (по умолчанию opus; auto запускает роутер на Haiku)
+         → факты: все, если их не больше FACTS_FULL_LIMIT, иначе поиск в pgvector
+         → system (статичный) + история + канон в хвосте последнего сообщения
+         → Anthropic Messages API, стриминг
+         → ответ порциями до 4096 символов
 ```
 
-**Stack.** Python (`python-telegram-bot`), the raw Anthropic SDK, Voyage for
-embeddings, Postgres with pgvector for vector search, flat files for state. Packaged
-as a Docker image; the bot joins the shared Postgres container's network and uses its
-own database and role. Deployment is a GitHub
-Actions workflow that SSHes to the server on push to `main`, pulls, and rebuilds.
+## Путь одного сообщения
 
-**Backups.** Facts are the only irreplaceable state (the user authors them by hand),
-so they get a belt-and-suspenders treatment. Every write mirrors to a separate
-`backups/` volume and is restored on startup if the working copy is wiped — protection
-against a `git reset --hard` or volume rebuild. On top of that, a cron-driven script
-(`scripts/backup_facts.sh`) tars `facts/` + `prompts/`, encrypts them with `gpg`
-(symmetric AES256), and keeps a rolling 14-archive window. Restore is documented in the
-[README](../README.md#backups). The principle: *the server is the source of truth, so
-the source of truth is the thing you back up twice.*
+1. Проверка белого списка `ALLOWED_USERS`. Если переменная пуста, бот открыт всем.
+2. Текст сообщения (или содержимое присланного `.txt`) добавляется в историю, история обрезается.
+3. Режим модели читается из `models/<chat_id>.txt`. Нет файла: opus. Режим `auto`: вызывается классификатор.
+4. `get_relevant_facts` возвращает факты и строку `source` для лога.
+5. `build_messages` собирает запрос, `system_block` оборачивает системный промпт.
+6. Генерация идёт через `client.messages.stream`, `max_tokens` по умолчанию 32000. Стриминг нужен потому, что SDK отказывается от запросов без стрима, которые могут идти дольше 10 минут.
+7. Из ответа `response_text()` склеивает только text-блоки.
+8. Пустой текст: в историю ничего не пишется, пользователь получает «пустой ответ (stop_reason=...)», в ops-тред уходит предупреждение со `stop_reason`, usage и моделью.
+9. Ответ режется по абзацам до 4096 символов и уходит сообщениями.
+10. В лог пишется строка `done:` с числом символов, токенами, `cache r`/`w` и ценой.
 
-## How it evolved
+Короткие вызовы (классификатор, `/summarize`) идут без стрима.
 
-It started as a **local script on a laptop** — one file, JSON facts on disk, run by
-hand. That was the right size for proving the routing idea, and it stayed that size
-until the idea was proven.
+## Модель и размышления
 
-Then it moved to **Docker on a VPS**, with auto-deploy on push, so the thing I edit
-on the laptop is the thing that runs. Persistence became volumes; the deploy became a
-workflow instead of a manual `scp`.
+Opus 5.5 в `content` отдаёт `ThinkingBlock` первым блоком. Раньше код брал `content[0].text` и падал на блоке без `.text`. Сейчас везде используется `response_text()`.
 
-**RAG arrived when the facts did.** Context-stuffing was fine while canon was small;
-once the fact list crossed into the hundreds, the cost and the noise both crossed the
-line where retrieval pays for itself. I didn't build RAG because it was interesting —
-I built it when the prompt got fat.
+Токены размышления в ответе не видны, но входят в `output_tokens` и оплачиваются как output. Косвенное подтверждение из лога 14.11.2026: ответ 1625 символов и `1.8k out`. Для русского текста такой длины это заметно меньше, остальное похоже на размышления. Точной разбивки API не даёт, поэтому это оценка, а не измерение.
 
-**Models moved to env after a deprecation bit me.** A hardcoded Opus ID went 404 in
-production. The fix was config-izing the IDs and re-keying pricing to aliases — which
-is decision #5, written the day the lesson cost me a redeploy.
+Если при `stop_reason=max_tokens` текста нет, значит, весь бюджет ушёл на размышления. Бот в этом случае отвечает «пустой ответ» и не пишет ничего в историю.
 
-Each of those was reactive on purpose. I'd rather add the layer when the system tells
-me it's needed than carry it speculatively from day one.
+## Кеширование
 
-## What's next
+- `system` статичный: только текст системного промпта чата, с `cache_control` типа `ephemeral` и TTL 1 час (`CACHE_TTL`, можно `5m`).
+- Канон в `system` не попадает. Его дописывает `build_messages` к концу последнего сообщения пользователя. Поэтому набор фактов может меняться от запроса к запросу, а префикс (system и история) остаётся тем же.
+- Точка кеширования стоит на последнем ответе ассистента: кешируется всё до него. Канон в историю в памяти не записывается.
+- История обрезается пачкой. Когда набирается `MAX_HISTORY` пар (8), остаются последние `HISTORY_KEEP` (4). При скользящем окне префикс менялся бы на каждом ходу и кеш не попадал бы никогда.
+- Запись в кеш с TTL 1 час стоит два input, чтение пять или десять процентов input (см. цены).
 
-Sequenced, with the reasoning for the order:
+Проверка по логам, 14.11.2026, sonnet, шесть запросов подряд: `cache r` каждого запроса равен `r + w` предыдущего (3355 + 750 = 4105, 4105 + 439 = 4544, 4544 + 541 = 5085, 5085 + 639 = 5724). 3355 токенов это системный промпт. Кеш растёт ровно на приращение каждого хода.
 
-- **Generation-quality evals.** Before tuning anything, I want a way to measure
-  "better" that isn't my gut. Everything downstream of this is guesswork until it
-  exists, so it's first.
-- **Observability (Langfuse).** Trace routing decisions, latencies, and cost per turn.
-  I can't improve what I'm not watching, and right now the router is a probabilistic
-  component I mostly trust on faith.
-- **Reranking on top of RAG.** Retrieval is pure vector similarity today; a rerank pass
-  would tighten which facts actually reach the prompt. This comes *after* evals, so I
-  can prove it helps instead of assuming it does.
-- **A scoped seam for external device integration.** There's a deliberately narrow
-  abstraction boundary laid in for it — designed, not built. I'm not committing to the
-  shape yet, because I'd rather ship a small thing I fully understand than a big one I'm
-  pretending to.
+## Факты
 
-The through-line under all of it: AI/LLM engineering — model routing, resilient LLM
-plumbing, retrieval — is the discipline this project exists to practice, and the only
-way I know to learn it is by shipping it.
+Хранение. Источник правды: `facts/<user_id>.json`, JSON-список строк в порядке добавления. При каждой записи копия пишется в `backups/facts/<user_id>.json`. Если при старте рабочий файл пуст, а копия нет, файл восстанавливается из копии.
 
-*A roadmap is a set of bets; the honest ones admit which bet they haven't placed yet.*
+Индекс. Таблица `facts` в базе `klgpff`: `user_id bigint`, `fact_index integer`, `fact_text text`, `embedding vector(512)`, первичный ключ `(user_id, fact_index)`. Эмбеддинги Voyage `voyage-3-lite` (512 измерений). Расширение `vector` создаёт админ БД, у роли бота прав на это нет. Индекс пересоздаётся целиком: при `/remember`, `/forget`, при восстановлении из копии и при первом обращении, если индекс пуст. Эмбеддинги считаются до транзакции, замена атомарна: если Voyage недоступен, старый индекс остаётся.
+
+Поиск. Точный перебор по косинусному расстоянию (`<=>`), ANN-индекса нет. По комментарию в `rag.py` HNSW имеет смысл от десятков тысяч строк, у меня 132, замеров скорости я не делал. Запросов два: текущее сообщение (до 1500 символов) и контекст (две предыдущие реплики пользователя и первые 800 символов последнего ответа, всего до 2000). Первое сообщение чата даёт один запрос. На каждый запрос берётся 30 ближайших (`RAG_TOP_K`), результаты склеиваются без дублей, остаётся не больше 50 лучших (`RAG_MAX_FACTS`), порядок возвращается авторский, по `fact_index`.
+
+Порог. Пока фактов не больше `FACTS_FULL_LIMIT` (150), поиск не используется, модель получает все факты, в логе `source` равен `all (<= 150)`. Сейчас фактов 132, то есть в проде поиск не работает вообще. Он включается, когда фактов станет больше 150, или при `FACTS_FULL_LIMIT=0`.
+
+Деградация. Если БД недоступна или нет ключа Voyage, бот отдаёт все факты (`source` вида `fallback`) и шлёт предупреждение в ops-тред. Пустой индекс заполняется заново из файла.
+
+Известное ограничение. Короткие справочные факты (имена, город, внешность) мало похожи на запрос вроде «сцена: ссора», поэтому при включённом поиске они могут не попасть в выдачу. Прогон слепого теста 14.11.2026 с одним запросом и лимитом 0 показал: в промпт попадало 30 фактов из 132, а из восьми ключевых фактов (имена, город, внешность) в выдачу попадало от 0 до 3 на кейс (подробнее в [EVALS.md](EVALS.md)). Закреплённых фактов, которые попадали бы в выдачу всегда, нет. Это не сделано.
+
+## Роутер
+
+`classify_message` вызывает Haiku с `max_tokens=4` и системным промптом `CLASSIFIER_PROMPT`. Решение принимается по тому, что должен содержать ответ:
+
+- opus: новая проза с нуля (сцена, рассказ, глава), включая голые запросы вроде «сцена про них» и «ещё одну»;
+- sonnet: проза на основе существующего текста (продолжить, переписать, сократить, добавить деталь);
+- haiku: только если ответ не проза для чтения (вопросы о героях или фактах, планирование, мета-разговор).
+
+В сомнительных случаях sonnet. Ответ разбирается поиском подстроки `opus`, `sonnet`, `haiku`. При исключении, пустом ответе или ответе без этих слов возвращается sonnet, при исключении ещё уходит предупреждение в ops-тред.
+
+Режим по умолчанию теперь opus, роутер не вызывается. Он включается командой `/model auto`. Причина: слепой тест моделей (см. [EVALS.md](EVALS.md)): в первом прогоне opus выиграл 5 кейсов из 8, во втором 3 из 3 у haiku. Кроме того, 14.11.2026 роутер отправил на haiku запрос, на который пришёл ответ в 11575 символов (до исправления `CLASSIFIER_PROMPT`). `/scene` всегда идёт на Opus. `/regenerate` в режиме `auto` берёт модель из `CLAUDE_MODEL`, роутер там не работает.
+
+## Цены
+
+Таблица `PRICING` в коде, доллары за миллион токенов, ноябрь 2026. Значения сверял автор по странице цен Anthropic, я их не проверял.
+
+| Модель | input | output | cache write (1 час) | cache read |
+|---|---|---|---|---|
+| Opus 5.5 | 4.00 | 20.00 | 8.00 | 0.20 |
+| Sonnet 5.5 | 2.00 | 10.00 | 4.00 | 0.10 |
+| Haiku 5.5 | 0.10 | 0.50 | 0.20 | 0.01 |
+
+Цена записи в кеш считается из input: умножить на 2 для TTL 1 час, на 1.25 для 5 минут (`cost_for_model`). Для Haiku цены указаны для промпта до 100K токенов, выше он дороже (по комментарию в коде, нашего размера это не касается). Таблица привязана к алиасам `opus`, `sonnet`, `haiku`, а не к ID моделей: при смене версии в `.env` расчёт не ломается. Токены учитываются в `usage/<chat_id>.json` по ID модели в четырёх корзинах: input, output, cache read, cache write. Старые ID (Opus 4.8, Sonnet 4.6 и другие) сопоставляются с алиасами, чтобы `/cost` не терял прошлые расходы. По каждой модели `/cost` показывает долю попаданий в кеш, `cache_read / (input + cache_read)`: это быстрая проверка, что кеш работает.
+
+## Сжатие истории
+
+`/summarize` отправляет Haiku весь диалог с просьбой сжать его до 500 слов (персонажи, события, где остановились, тон) и заменяет историю двумя сообщениями: вопрос «Что произошло до этого момента?» и краткое содержание. Работает, если в истории не меньше 4 сообщений. Вызов тоже попадает в `/cost`.
+
+## Хранение и перезапуск
+
+Всё изменяемое состояние лежит в файлах, которые пишутся сразу при изменении (таблица в [README](../README.md#хранение)). `PicklePersistence` из `python-telegram-bot` не используется: он сбрасывает данные на диск по интервалу и при остановке, и при перезапуске в этот момент свежая правка промпта потерялась бы. История диалога (`conversations`) хранится только в памяти: после перезапуска контекст пустой, факты и промпт сохраняются.
+
+## Переменные окружения
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | обязательна | Токен BotFather |
+| `ANTHROPIC_API_KEY` | обязательна | Ключ Anthropic |
+| `VOYAGE_API_KEY` | пусто | Ключ Voyage, без него поиск отключён, отдаются все факты |
+| `DATABASE_URL` | пусто | Строка подключения к Postgres, без неё то же самое |
+| `ALLOWED_USERS` | пусто | Telegram ID через запятую, пусто значит открыт всем |
+| `MODEL_OPUS`, `MODEL_SONNET`, `MODEL_HAIKU` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | ID моделей для алиасов |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Модель для `/regenerate` в режиме auto |
+| `MAX_HISTORY` | 8 | Пар в истории до обрезки |
+| `HISTORY_KEEP` | 4 | Сколько пар оставить после обрезки |
+| `CACHE_TTL` | `1h` | TTL кеша, `5m` или `1h` |
+| `RAG_TOP_K` | 30 | Фактов на один поисковый запрос |
+| `RAG_MAX_FACTS` | 50 | Потолок фактов из поиска |
+| `FACTS_FULL_LIMIT` | 150 | До скольких фактов отдавать все без поиска, 0 значит поиск всегда |
+| `MAX_TOKENS` | 32000 | `max_tokens` на ответ |
+| `SYSTEM_PROMPT` | встроенный | Системный промпт для новых чатов |
+| `TG_LOG_BOT_TOKEN`, `TG_LOG_CHAT_ID`, `TG_LOG_THREAD_KLGPFF` | пусто | Логи в тему Telegram-группы, без любой из трёх отключены |
+| `BACKUP_PASSPHRASE` | пусто | Пароль для шифрованных архивов фактов |
+
+## Решения и их цена
+
+**Anthropic API напрямую.** Нужны стабильный системный промпт, выбор модели под задачу, свой `max_tokens` и кеш. Цена: авторизация, повторы, учёт расходов и замена устаревших моделей на мне.
+
+**Один Postgres с pgvector вместо отдельной векторной БД.** Фактов сотни, точный перебор быстр и без потерь, одним сервисом меньше. До 14.11.2026 векторы лежали в Qdrant, его контейнер и тома удалены, архив томов остался на сервере. Цена: Postgres общий с другим проектом. У роли `klgpff` права ограничены: она не читает таблицы чужих баз и не создаёт там объекты (проверено 14.11.2026), но `CONNECT` к другим базам кластера у неё есть, потому что по умолчанию он выдан `PUBLIC`.
+
+**Файлы для фактов.** Источник правды `facts/<user_id>.json`, индекс в БД производный и пересоздаётся. Цена: нет защиты от одновременной записи, при одном авторе она не нужна.
+
+**ID моделей в окружении, цены по алиасу.** Жёстко прописанный ID Opus однажды стал отдавать 404 и потребовал правки кода и деплоя. Сейчас это строка в `.env`.
+
+**Стриминг основной генерации.** Иначе длинная сцена при большом `max_tokens` упирается в десятиминутный предел SDK. Урезать `max_tokens` не подходит: короче становятся сцены.
+
+## Известные ограничения
+
+- Закреплённых фактов нет, см. раздел про факты. При фактах выше 150 имена, город и внешность могут не попасть в промпт.
+- Метрика «противоречий канону» в слепом тесте считается судьёй, который сам модель (Sonnet). Если поиск включён, судья видит тот же урезанный список фактов, что и модель, поэтому нарушений по фактам, которые не попали в выдачу, он не заметит.
+- Автоматических тестов в репозитории нет. Для слепого теста есть скрипты в `evals/`, для остального только проверки `pyflakes` и импорт модуля.
+- При старте в логе предупреждение `PTBUserWarning` про `heartbeat_loop`: задача создаётся до запуска приложения. Heartbeat при этом пишется и healthcheck зелёный, причину я не разбирал.
+- Расширение `vector` в этой базе версии 0.8.7, а в базе `nexus_arcana` 0.8.3. Это разные базы, обновление одной не трогает другую.
