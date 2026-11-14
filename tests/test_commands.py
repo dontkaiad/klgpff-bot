@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import claude_tg_bot as bot  # noqa: E402
 
-KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget"}
-REMOVED = {"facts", "system", "summarize", "setsystem"}
+KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget", "facts"}
+REMOVED = {"system", "summarize", "setsystem"}
 
 
 class CommandSetTests(unittest.TestCase):
@@ -62,7 +62,7 @@ class LogCommandTests(unittest.TestCase):
         self.assertIn("command /model user=7", self._run("/Model@some_bot auto", user_id=7)[0])
 
     def test_unknown_command_is_logged(self):
-        self.assertIn("command /facts user=1", self._run("/facts", user_id=1)[0])
+        self.assertIn("command /setsystem user=1", self._run("/setsystem", user_id=1)[0])
 
     def test_no_text_is_ignored(self):
         update = SimpleNamespace(effective_message=SimpleNamespace(text=None), effective_user=None)

@@ -556,7 +556,8 @@ HELP_TEXT = (
     "🧠 память (сохраняется между сессиями):\n"
     "/remember <факт> — запомнить (📌 в начале закрепляет: факт всегда в промпте)\n"
     "/forget <номер> — забыть по номеру\n"
-    "/forget all — забыть всё\n\n"
+    "/forget all — забыть всё\n"
+    "/facts — все факты с номерами для /forget\n\n"
     "⚙️ настройки:\n"
     "/addprompt <текст> — добавить к существующему\n"
     "/model — текущий режим\n"
@@ -572,6 +573,7 @@ BOT_COMMANDS = [
     ("regenerate", "перегенерить последний ответ (можно с правкой)"),
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
+    ("facts", "показать все факты с номерами"),
     ("addprompt", "добавить к существующему промпту"),
     ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
     ("cost", "расходы по этому чату"),
@@ -652,6 +654,50 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "напиши номер: /forget 3\nили /forget all"
         )
+
+
+FACTS_MSG_LIMIT = 3800  # символов в одном сообщении со списком (лимит Telegram 4096)
+
+
+def facts_messages(facts: list[str], limit: int = FACTS_MSG_LIMIT) -> list[str]:
+    """Нумерованный список фактов, нарезанный на сообщения по границам фактов.
+
+    Номер это позиция строки в facts/<id>.json с единицы, ровно то, что принимает
+    /forget. Факт не режется, пока он сам помещается в limit; один факт длиннее
+    limit режется по символам (остаток без номера), чтобы ничего не потерять.
+    Закреплённые факты идут как хранятся, с маркером."""
+    chunks: list[str] = []
+    cur = ""
+    for i, fact in enumerate(facts):
+        item = f"{i + 1}. {fact}"
+        while len(item) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(item[:limit])
+            item = item[limit:]
+        block = f"{cur}\n\n{item}" if cur else item
+        if len(block) <= limit:
+            cur = block
+        else:
+            chunks.append(cur)
+            cur = item
+    if cur:
+        chunks.append(cur)
+    if chunks:
+        chunks[0] = "🧠 факты:\n\n" + chunks[0]
+    return chunks
+
+
+async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    facts = load_facts(update.effective_user.id)
+    if not facts:
+        await update.message.reply_text("пусто. добавь через /remember <факт>")
+        return
+    for chunk in facts_messages(facts):
+        await update.message.reply_text(chunk)
 
 
 async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1019,6 +1065,7 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("facts", cmd_facts))
     app.add_handler(CommandHandler("addprompt", cmd_addprompt))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("cost", cmd_cost))
