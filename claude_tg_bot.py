@@ -886,24 +886,19 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
 
 
 CLASSIFIER_PROMPT = (
-    "You are a router for a creative-writing chat bot. The user writes in Russian "
-    "or English. Classify the user's message and reply with EXACTLY ONE word: "
-    "opus, sonnet, or haiku. No quotes, no punctuation, no explanation.\n\n"
-    "Rules:\n"
-    "- opus — request to WRITE A NEW scene/fanfic from scratch.\n"
-    "  RU triggers: «напиши», «придумай», «создай сцену», «сочини», «напиши сцену».\n"
-    "  EN triggers: \"write\", \"create\", \"make a scene\", \"come up with\".\n"
-    "- sonnet — continue / rewrite / extend / edit existing text.\n"
-    "  RU triggers: «продолжи», «перепиши», «допиши», «измени», «отредактируй».\n"
-    "  EN triggers: \"continue\", \"rewrite\", \"extend\", \"edit\", \"change\".\n"
-    "- haiku — everything else: discussion, questions, short replies, meta-talk "
-    "about characters, planning, clarifications.\n\n"
+    "You are a router for a Russian/English creative-writing chat bot. Reply with EXACTLY ONE word: opus, sonnet, or haiku. No quotes, no punctuation, no explanation.\n\n"
+    "Decide by what the REPLY must contain, not by the verbs used. Messages are casual and often have no verb (\"короткая сцена про них\", \"ещё одну\", \"а теперь в баре\").\n\n"
+    "- opus — the reply is a NEW piece of prose: a scene, story, chapter or fragment written from scratch. Includes bare noun requests (\"сцена про X\", \"короткая сцена\", \"ещё одну сцену\"), a new situation to write about, \"придумай\", \"напиши\", \"write\".\n"
+    "- sonnet — the reply is prose built on existing text: continue, rewrite, shorten, extend, change style / POV / tone, fix, add a detail (\"продолжай\", \"перепиши короче\", \"добавь деталь\", \"дальше\", \"а потом\", \"измени\").\n"
+    "- haiku — ONLY when the reply is NOT prose to be read as a story: questions about characters or facts, planning, brainstorming, meta-talk, greetings, short clarifications.\n\n"
+    "When unsure between haiku and anything else, choose sonnet. Never choose haiku for a request that could produce a scene.\n\n"
     "Output: opus | sonnet | haiku"
 )
 
 
 async def classify_message(chat_id: int, user_text: str) -> str:
-    """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'haiku' on any error.
+    """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'sonnet' on any error
+    and when the reply is empty or names none of the three.
     async только ради await send_log в фолбэке; сам вызов client остаётся
     синхронным, как и в остальном коде."""
     try:
@@ -919,9 +914,9 @@ async def classify_message(chat_id: int, user_text: str) -> str:
             if alias in result:
                 return alias
     except Exception as e:
-        logger.warning(f"classify_message fallback to haiku: {e}")
-        await send_log(f"⚠️ klgpff classifier fallback→haiku: {e!r}")
-    return "haiku"
+        logger.warning(f"classify_message fallback to sonnet: {e}")
+        await send_log(f"⚠️ klgpff classifier fallback→sonnet: {e!r}")
+    return "sonnet"
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
