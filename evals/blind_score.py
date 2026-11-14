@@ -24,7 +24,8 @@ def main():
 
     ranks = {m: [] for m in models}
     for tok in sys.argv[2:]:
-        m = re.fullmatch(r"(\d+)([A-Ca-c]{3})", tok)
+        tok = tok.translate(str.maketrans("АВСавс", "ABCabc"))
+        m = re.fullmatch(r"(\d+)([A-Ca-c]{2,3})", tok)
         if not m:
             sys.exit(f"не понял токен {tok!r}, нужен вид 1BAC")
         idx, order = int(m.group(1)), m.group(2).upper()
