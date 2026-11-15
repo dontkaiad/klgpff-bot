@@ -68,7 +68,7 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 SCENE_TOP_K = int(os.environ.get("SCENE_TOP_K", "3"))
 # Защита от дорогих запросов. Дневной лимит считается по расходам за сегодня
 # (дата по UTC+3, данные те же, что у /cost); 0 или меньше выключает его.
-DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "1.00"))
+DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "2.00"))
 # Обычное сообщение (не команда) длиннее этого в модель не уходит: длинный текст
 # это обычно сцена, вставленная частями, и каждая часть стоила бы запроса Opus.
 MAX_INPUT_CHARS = 3500
