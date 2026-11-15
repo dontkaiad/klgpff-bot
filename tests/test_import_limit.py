@@ -380,6 +380,14 @@ class DailyLimitTests(Base):
         self.assertLessEqual(len(bot.load_usage(111)["_daily"]), bot.DAILY_KEEP_DAYS)
 
 
+class DefaultLimitTests(unittest.TestCase):
+    def test_default_daily_limit_is_one_dollar(self):
+        src = (Path(__file__).resolve().parent.parent / "claude_tg_bot.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("DAILY_LIMIT_USD", "1.00")', src)
+        if "DAILY_LIMIT_USD" not in os.environ:
+            self.assertEqual(bot.DAILY_LIMIT_USD, 1.0)
+
+
 class CostCommandTests(Base):
     def test_cost_shows_today_and_limit(self):
         self.spend(111, 1.0)
