@@ -90,7 +90,7 @@ class Base(unittest.TestCase):
 
         message = SimpleNamespace(
             text=text, reply_text=reply_text, reply_to_message=None, forward_origin=forward_origin,
-            date=at(0), **extra,
+            date=extra.pop("date", at(0)), **extra,
         )
         upd = SimpleNamespace(
             effective_user=SimpleNamespace(id=user_id),
@@ -416,7 +416,7 @@ class InputSizeTests(Base):
         self.assertEqual(
             out,
             ["длинный текст не отправлен в модель, чтобы не тратить деньги; "
-             "для сохранения сцены перешли её части боту и вызови /keep"],
+             "для сохранения сцены: /import, части (или .txt), /done"],
         )
         self.assertNotIn(text[:50], "\n".join(cm.output))  # текст в лог не пишется
         self.assertEqual(bot.conversations, {})

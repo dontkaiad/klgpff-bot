@@ -569,6 +569,7 @@ class GenerateTests(unittest.TestCase):
             mock.patch.object(bot, "alert_warn", new=mock.AsyncMock()),
             mock.patch.object(bot, "send_alert", new=mock.AsyncMock()),
             mock.patch.object(bot, "SCENE_TOP_K", 3),
+            mock.patch.object(bot, "scenes_enabled", return_value=True),  # по умолчанию память сцен выключена
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -611,14 +612,14 @@ class GenerateTests(unittest.TestCase):
     def test_done_log_reports_scene_count(self):
         _, log, _ = self.generate()
         done = next(l for l in log if "done:" in l)
-        self.assertTrue(done.endswith("scenes=2"), done)
+        self.assertIn(" scenes=2 ", done + " ")
 
     def test_no_scenes_request_is_exactly_as_before(self):
         self.search.return_value = []
         kwargs, log, _ = self.generate()
         self.assertEqual(kwargs["messages"], bot.build_messages(HIST, CANON))
         self.assertNotIn("memory_scenes", str(kwargs))
-        self.assertTrue(next(l for l in log if "done:" in l).endswith("scenes=0"))
+        self.assertIn(" scenes=0 ", next(l for l in log if "done:" in l) + " ")
 
     def test_search_failure_sends_request_without_block_and_warns(self):
         self.search.side_effect = RuntimeError("voyage down")
@@ -627,7 +628,7 @@ class GenerateTests(unittest.TestCase):
         self.assertNotIn("memory_scenes", str(kwargs))
         self.assertEqual(replies, ["ответ 2"])  # бот ответил как обычно
         self.assertTrue(any("WARNING" in l and "память сцен" in l for l in log), log)
-        self.assertTrue(next(l for l in log if "done:" in l).endswith("scenes=0"))
+        self.assertIn(" scenes=0 ", next(l for l in log if "done:" in l) + " ")
 
     def test_scene_text_never_reaches_the_log(self):
         _, log, _ = self.generate()

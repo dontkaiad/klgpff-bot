@@ -11,6 +11,7 @@ Telegram-бот для creative writing через Anthropic API.
 import asyncio
 import json
 import os
+import re
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,7 @@ def load_dotenv():
 load_dotenv()
 
 import anthropic
+import extract
 import rag
 from tg_logger import alert_error, alert_warn, exc_where, send_alert
 from ops_transient import TransientTracker, is_transient
@@ -74,6 +76,16 @@ DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "2.00"))
 MAX_INPUT_CHARS = 3500
 # Части сцены, пересланные боту от него самого: сколько хранить без новых частей.
 FORWARD_BUFFER_TTL = 30 * 60
+# Режим /import и буфер частей: потолок буфера в символах и размер принимаемого файла.
+IMPORT_BUFFER_MAX_CHARS = 60000
+IMPORT_DOC_MAX_BYTES = 200 * 1024
+# Извлечение кандидатов в факты (extract.py): после /done и после каждой сцены,
+# которую написал бот (ответ от EXTRACT_MIN_WORDS слов). В факты попадает только по /accept.
+EXTRACT_ENABLED = os.environ.get("EXTRACT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+EXTRACT_MIN_WORDS = int(os.environ.get("EXTRACT_MIN_WORDS", "300"))
+SIM_DEDUP = float(os.environ.get("SIM_DEDUP", "0.92"))  # косинус, с которого кандидат считается дублем
+EXTRACT_MAX_INPUT_CHARS = 60000
+EXTRACT_MAX_TOKENS = 1500
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
 # менять версию модели без правки кода.
@@ -83,6 +95,7 @@ MODELS = {
     "haiku": os.environ.get("MODEL_HAIKU", "claude-haiku-5-5"),
 }
 CLASSIFIER_MODEL = MODELS["haiku"]
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL") or MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
 # Ключи — алиасы (opus/sonnet/haiku), а не ID: при смене версии в .env
@@ -313,11 +326,30 @@ def get_relevant_facts(user_id: int, history: list[dict]):
         return all_facts, "fallback — vector DB unavailable"
 
 
+def scenes_flag_path(user_id: int) -> Path:
+    return MODELS_DIR / f"{user_id}.scenes"
+
+
+def scenes_enabled(user_id: int) -> bool:
+    """Подмешивание памяти сцен включено для юзера? По умолчанию нет: в запрос идут
+    только промпт и факты. Состояние в файле models/<user_id>.scenes (как режим /model),
+    переживает перезапуск."""
+    try:
+        return scenes_flag_path(user_id).read_text(encoding="utf-8").strip() == "on"
+    except Exception:
+        return False
+
+
+def set_scenes_enabled(user_id: int, on: bool):
+    scenes_flag_path(user_id).write_text("on" if on else "off", encoding="utf-8")
+
+
 def get_memory_scenes(user_id: int, history: list[dict]) -> list:
     """Фрагменты сохранённых сцен для текущего запроса: [(номер, текст)].
-    Те же поисковые запросы, что у фактов. Сцен нет, поиск выключен или упал: []
-    и запрос уходит как раньше (при сбое warning в лог, без текста запроса)."""
-    if SCENE_TOP_K < 1:
+    Те же поисковые запросы, что у фактов. Память сцен выключена (по умолчанию),
+    сцен нет, поиск отключён или упал: [] и запрос уходит как раньше (при сбое
+    warning в лог, без текста запроса)."""
+    if SCENE_TOP_K < 1 or not scenes_enabled(user_id):
         return []
     queries = retrieval_queries(history)
     if not queries:
@@ -565,6 +597,11 @@ def limit_line(chat_id: int) -> str:
     return f"сегодня (UTC+3): ≈ ${spent:.2f} из ${DAILY_LIMIT_USD:.2f} (DAILY_LIMIT_USD)"
 
 
+def over_daily_limit(chat_id: int) -> bool:
+    """Дневной лимит исчерпан? (без ответа пользователю: для фоновых вызовов)"""
+    return DAILY_LIMIT_USD > 0 and spent_today(chat_id) >= DAILY_LIMIT_USD
+
+
 async def block_if_over_limit(update, chat_id: int) -> bool:
     """True и ответ пользователю, если дневной лимит исчерпан: вызывать API нельзя.
     Проверка стоит перед каждым входом в модель (классификатор тоже считается)."""
@@ -663,11 +700,17 @@ HELP_TEXT = (
     "/forget <номер> — забыть по номеру\n"
     "/forget all — забыть всё\n"
     "/facts — все факты с номерами для /forget\n\n"
-    "🎬 память сцен (только вручную):\n"
+    "📥 загрузка текста (без модели, без расходов):\n"
+    "/import — режим приёма: присылай части, пересылки или .txt/.md файл\n"
+    "/done — сохранить принятое как сцену и найти кандидатов в факты\n"
+    "/cancel — выйти из режима без сохранения\n"
+    "/accept <номера|all> — принять кандидатов в факты\n\n"
+    "🎬 память сцен (только вручную, по умолчанию не подмешивается):\n"
     "/keep — сохранить сцену (ответом на сообщение бота; пересланные боту части сцены склеит; иначе последний ответ)\n"
     "/scenes — сохранённые сцены с номерами\n"
     "/unkeep <номер> — удалить сцену\n\n"
     "⚙️ настройки:\n"
+    "/context — что уйдёт в модель; /context scenes on|off — память сцен\n"
     "/addprompt <текст> — добавить к существующему\n"
     "/model — текущий режим\n"
     "/model auto — классификатор решает\n"
@@ -686,6 +729,11 @@ BOT_COMMANDS = [
     ("keep", "сохранить сцену в память (ответом на сообщение бота)"),
     ("scenes", "сохранённые сцены с номерами"),
     ("unkeep", "удалить сохранённую сцену по номеру"),
+    ("import", "режим приёма: части сцены или .txt, в конце /done"),
+    ("done", "сохранить принятый текст как сцену"),
+    ("cancel", "выйти из режима /import без сохранения"),
+    ("accept", "принять кандидатов в факты: номера или all"),
+    ("context", "что уйдёт в модель; scenes on|off"),
     ("addprompt", "добавить к существующему промпту"),
     ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
     ("cost", "расходы по этому чату"),
@@ -713,7 +761,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     conversations[update.effective_chat.id] = []
-    forward_buffers.pop(update.effective_user.id, None)
+    clear_import(update.effective_user.id)  # буфер частей и режим /import
     await update.message.reply_text("контекст сброшен. факты сохранены.")
 
 
@@ -818,7 +866,9 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # буфер (в памяти процесса, свой на пользователя), /keep без ответа сохраняет
 # склеенную сцену. Буфер живёт FORWARD_BUFFER_TTL без новых частей, сбрасывается
 # по /new и после сохранения.
-forward_buffers: dict = {}  # user_id -> {"parts": [(дата, seq, текст)], "hashes", "seq", "last"}
+forward_buffers: dict = {}  # user_id -> {"parts": [(дата, seq, текст)], "hashes", "seq", "chars", "last", "import"}
+# user_id, у которых режим /import погас по таймауту, а юзер ещё не уведомлён.
+import_expired: set = set()
 
 
 def _now() -> float:
@@ -829,10 +879,38 @@ def _live_buffer(user_id: int, create: bool = False):
     b = forward_buffers.get(user_id)
     if b is not None and _now() - b["last"] > FORWARD_BUFFER_TTL:
         forward_buffers.pop(user_id)
+        if b.get("import"):
+            import_expired.add(user_id)
         b = None
     if b is None and create:
-        b = forward_buffers[user_id] = {"parts": [], "hashes": set(), "seq": 0, "last": _now()}
+        b = forward_buffers[user_id] = {
+            "parts": [], "hashes": set(), "seq": 0, "chars": 0, "last": _now(), "import": False,
+        }
     return b
+
+
+def import_active(user_id: int) -> bool:
+    b = _live_buffer(user_id)
+    return bool(b and b["import"])
+
+
+def clear_import(user_id: int):
+    """Выход из режима /import и очистка буфера (по /new, /cancel, /done, /keep)."""
+    forward_buffers.pop(user_id, None)
+    import_expired.discard(user_id)
+
+
+async def notify_import_expired(update, user_id: int) -> bool:
+    """Если режим /import погас по таймауту, сообщает об этом один раз и возвращает
+    True: текущее сообщение не обрабатывается (иначе часть фанфика ушла бы в модель)."""
+    if user_id not in import_expired:
+        return False
+    import_expired.discard(user_id)
+    await update.message.reply_text(
+        "режим /import выключен: 30 минут без новых частей, буфер очищен. "
+        "это сообщение не обработано; начни заново: /import"
+    )
+    return True
 
 
 def forwarded_from_bot(msg, bot_id: int):
@@ -853,18 +931,22 @@ def forwarded_from_bot(msg, bot_id: int):
     return None
 
 
-def add_forwarded_part(user_id: int, ts: float, text: str):
-    """Кладёт часть в буфер. Возвращает (число частей, новая ли). Дубль (тот же
-    текст) не добавляется."""
+def add_part(user_id: int, ts: float, text: str):
+    """Кладёт часть в буфер. Возвращает (число частей, статус): "new", "dup" (тот же
+    текст уже есть) или "full" (не помещается в IMPORT_BUFFER_MAX_CHARS)."""
     b = _live_buffer(user_id, create=True)
     b["last"] = _now()
+    text = text.strip()
     h = rag.scene_hash(text)
     if h in b["hashes"]:
-        return len(b["parts"]), False
+        return len(b["parts"]), "dup"
+    if b["chars"] + len(text) > IMPORT_BUFFER_MAX_CHARS:
+        return len(b["parts"]), "full"
     b["hashes"].add(h)
     b["seq"] += 1
-    b["parts"].append((ts, b["seq"], text.strip()))
-    return len(b["parts"]), True
+    b["chars"] += len(text)
+    b["parts"].append((ts, b["seq"], text))
+    return len(b["parts"]), "new"
 
 
 def buffered_parts(user_id: int) -> list:
@@ -874,6 +956,22 @@ def buffered_parts(user_id: int) -> list:
     if not b:
         return []
     return [t for _, _, t in sorted(b["parts"], key=lambda x: (x[0], x[1]))]
+
+
+async def accept_part(update, user_id: int, ts: float, text: str, import_mode: bool):
+    """Часть в буфер и короткий ответ без модели."""
+    n, status = add_part(user_id, ts, text)
+    logger.info(f"[user {user_id}] 📥 part {status}, {n} in buffer" + (" (import)" if import_mode else ""))
+    if status == "new":
+        reply = f"часть {n}, {len(text.split())} слов" if import_mode else f"часть {n} принята"
+    elif status == "dup":
+        reply = f"эта часть уже принята (всего {n})"
+    else:
+        reply = (
+            f"буфер ограничен {IMPORT_BUFFER_MAX_CHARS} символов, эта часть не принята и дальше не принимаю. "
+            "/done сохранит накопленное, /cancel сбросит"
+        )
+    await update.message.reply_text(reply)
 
 
 # --- Память сцен ---
@@ -924,6 +1022,9 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     replied = getattr(update.message, "reply_to_message", None)
     n_parts = 0
+    if replied is None and import_active(user_id):
+        await update.message.reply_text("идёт режим /import: заверши командой /done (или /cancel).")
+        return
     if replied is None:
         parts = buffered_parts(user_id)
         n_parts = len(parts)
@@ -1034,6 +1135,232 @@ async def cmd_unkeep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(f"сцены {number} нет, список: /scenes")
+
+
+# --- Режим /import, извлечение кандидатов в факты, /accept, /context ---
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    b = _live_buffer(user_id, create=True)  # просроченный буфер заменяется новым
+    import_expired.discard(user_id)  # новый /import: старое уведомление о таймауте не нужно
+    b["import"] = True
+    b["last"] = _now()
+    n = len(b["parts"])
+    await update.message.reply_text(
+        "присылай части или .txt файл, в конце /done"
+        + (f"\n(в буфере уже частей: {n})" if n else "")
+    )
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    active = import_active(user_id)
+    if await notify_import_expired(update, user_id):
+        return
+    if not active:
+        await update.message.reply_text("режим /import не включён. начни с /import")
+        return
+    parts = buffered_parts(user_id)
+    if not parts:
+        clear_import(user_id)
+        await update.message.reply_text("буфер пуст, импорт завершён.")
+        return
+    text = "\n\n".join(parts)
+    request = " ".join(text.split())[:60]
+    try:
+        number, created = rag.save_scene(user_id, request, text)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] /done: сохранить не удалось: {e!r}")
+        await alert_warn("/done: сохранить не удалось", e)
+        await update.message.reply_text(
+            "не удалось сохранить: БД или Voyage недоступны. буфер цел, повтори /done позже."
+        )
+        return
+    clear_import(user_id)
+    words = len(text.split())
+    logger.info(
+        f"[user {user_id}] 📥 import done: scene {number} {'saved' if created else 'duplicate'}"
+        f" ({words} words, {len(parts)} parts)"
+    )
+    head = "✓ сохранена" if created else "уже сохранена"
+    await update.message.reply_text(f"{head}: сцена {number} (частей: {len(parts)}, слов: {words})")
+    extracted, cost = await run_extraction(update, chat_id, user_id, text, notify_empty=True)
+    logger.info(f"[user {user_id}] 📥 import extract: extracted={extracted} extract_cost=${cost:.4f}")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    active = import_active(user_id)
+    if await notify_import_expired(update, user_id):
+        return
+    b = forward_buffers.get(user_id)
+    k = len(b["parts"]) if b else 0
+    if not active and not k:
+        await update.message.reply_text("нечего отменять.")
+        return
+    clear_import(user_id)
+    await update.message.reply_text(f"импорт отменён, буфер очищен (частей: {k}). ничего не сохранено.")
+
+
+async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_empty: bool = False):
+    """Один вызов EXTRACT_MODEL: кандидаты в факты и противоречия канону. Идёт после
+    отправки сцены, результат отдельным сообщением без LLM. Возвращает (сколько
+    кандидатов показано, стоимость $). Никогда не бросает: любой сбой это warning
+    в лог и тишина для пользователя. В факты ничего не пишет, только /accept."""
+    cost = 0.0
+    if not EXTRACT_ENABLED:
+        return 0, cost
+    try:
+        if over_daily_limit(chat_id):
+            logger.warning(f"{_tag(chat_id)} 🛑 extraction skipped: daily limit reached")
+            return 0, cost
+        facts = [strip_pin(f) for f in load_facts(user_id)]
+        user_msg = extract.build_extract_input(facts, text, EXTRACT_MAX_INPUT_CHARS)
+        resp = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model=EXTRACT_MODEL,
+                max_tokens=EXTRACT_MAX_TOKENS,
+                system=extract.EXTRACT_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+        )
+        add_usage(chat_id, EXTRACT_MODEL, resp.usage)  # идёт в /cost и в дневной лимит
+        cost = cost_for_model(EXTRACT_MODEL, usage_bucket(resp.usage))
+        parsed = extract.parse_extraction(response_text(resp))
+        if parsed is None:
+            logger.warning(f"{_tag(chat_id)} extraction: ответ модели не разобран, пропуск")
+            return 0, cost
+        new_facts, conflicts = parsed
+        pending = [t for _, t in rag.pending_candidates(user_id)]
+        new_facts = extract.dedupe_normalized(new_facts, facts + pending)
+        if new_facts:
+            try:
+                new_facts = await asyncio.to_thread(
+                    rag.filter_similar, user_id, new_facts, pending, SIM_DEDUP
+                )
+            except Exception as e:
+                logger.warning(f"{_tag(chat_id)} extraction: проверка близости пропущена: {e!r}")
+        numbered = rag.add_candidates(user_id, new_facts) if new_facts else []
+        if numbered or conflicts:
+            await update.message.reply_text(extract.candidates_message(numbered, conflicts))
+        elif notify_empty:
+            await update.message.reply_text("новых фактов в тексте не найдено.")
+        return len(numbered), cost
+    except Exception as e:
+        logger.warning(f"{_tag(chat_id)} extraction failed: {e!r}")
+        return 0, cost
+
+
+def _fact_numbers(first: int, k: int) -> str:
+    return f"№ {first}" if k == 1 else f"№ {first}-{first + k - 1}"
+
+
+async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    arg = update.message.text.partition(" ")[2].strip().lower()
+    usage = "напиши номера из списка кандидатов: /accept 1 3 5 или /accept all"
+    if not arg:
+        await update.message.reply_text(usage)
+        return
+    nums = None
+    if arg != "all":
+        try:
+            nums = [int(t) for t in re.split(r"[,\s]+", arg) if t]
+        except ValueError:
+            await update.message.reply_text(usage)
+            return
+        if not nums or any(n < 1 for n in nums):
+            await update.message.reply_text(usage)
+            return
+    try:
+        claimed, already, missing = rag.claim_candidates(user_id, nums)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] /accept: БД недоступна: {e!r}")
+        await update.message.reply_text("кандидаты недоступны: БД не отвечает. попробуй позже.")
+        return
+    lines = []
+    if claimed:
+        facts = load_facts(user_id)
+        first = len(facts) + 1
+        facts.extend(t for _, t in claimed)
+        try:
+            save_facts(user_id, facts)
+        except Exception as e:
+            rag.release_candidates(user_id, [n for n, _ in claimed])  # кандидаты не потеряны
+            logger.warning(f"[user {user_id}] /accept: запись фактов не удалась: {e!r}")
+            await update.message.reply_text("не удалось записать факты, кандидаты остались. повтори позже.")
+            return
+        reindex_user_facts(user_id)  # тот же путь, что у /remember: индекс и бэкап файла
+        lines.append(f"✓ добавлено фактов: {len(claimed)} (в /facts {_fact_numbers(first, len(claimed))})")
+        lines += [f"{first + i}. {t[:80]}" for i, (_, t) in enumerate(claimed)]
+    if already:
+        lines.append("уже приняты раньше: " + ", ".join(map(str, already)))
+    if missing:
+        lines.append("нет таких кандидатов: " + ", ".join(map(str, missing)) + " (список живёт 24 часа)")
+    if not lines:
+        lines.append("нет ожидающих кандидатов.")
+    await update.message.reply_text("\n".join(lines))
+
+
+def context_report(user_id: int, chat_id: int) -> str:
+    """Что уйдёт в модель при следующем запросе, одними числами: без текстов
+    промпта и фактов, без вызова LLM."""
+    raw = load_facts(user_id)
+    total = len(raw)
+    if not total:
+        facts_line = "нет"
+    elif FACTS_FULL_LIMIT and total <= FACTS_FULL_LIMIT:
+        facts_line = f"все ({total})"
+    else:
+        facts_line = f"{sum(1 for f in raw if is_pinned(f))} закреплённых + поиск до {RAG_MAX_FACTS} из {total}"
+    on = scenes_enabled(user_id)
+    try:
+        saved = str(len(rag.list_scenes(user_id)))
+    except Exception:
+        saved = "н/д"
+    scenes_line = ("вкл (до %d фрагментов, справкой ниже канона)" % SCENE_TOP_K if on else "выкл") + f", сохранено сцен: {saved}"
+    mode = load_mode(chat_id)
+    mode_line = "auto (роутер)" if mode == "auto" else f"{mode} ({MODELS[mode]})"
+    lines = [
+        "🧭 что уйдёт в модель при следующем запросе:",
+        f"system-промпт: {len(load_prompt(chat_id))} симв.",
+        f"факты: {facts_line}",
+        f"память сцен: {scenes_line}",
+        f"режим модели: {mode_line}",
+        f"извлечение фактов из сцен: {'вкл' if EXTRACT_ENABLED else 'выкл'}",
+        limit_line(chat_id),
+    ]
+    if import_active(user_id):
+        lines.append("режим /import: идёт (запросы к модели не уходят)")
+    return "\n".join(lines)
+
+
+async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    args = update.message.text.partition(" ")[2].strip().lower().split()
+    if args:
+        if len(args) == 2 and args[0] == "scenes" and args[1] in ("on", "off"):
+            set_scenes_enabled(user_id, args[1] == "on")
+            await update.message.reply_text(
+                f"✓ память сцен включена: к запросам подмешивается до {SCENE_TOP_K} фрагментов "
+                "сохранённых сцен справкой ниже канона."
+                if args[1] == "on"
+                else "✓ память сцен выключена: в запрос идут только промпт и факты."
+            )
+            return
+        await update.message.reply_text("использование: /context или /context scenes on|off")
+        return
+    await update.message.reply_text(context_report(user_id, update.effective_chat.id))
 
 
 async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1206,6 +1533,11 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
                 sent_ids.append(sent.message_id)
         remember_reply_parts(chat_id, sent_ids, assistant_text)
 
+        # Сцена от бота: после отправки, отдельным сообщением, предлагаем кандидатов в факты.
+        extracted, extract_cost = 0, 0.0
+        if EXTRACT_ENABLED and len(assistant_text.split()) >= EXTRACT_MIN_WORDS:
+            extracted, extract_cost = await run_extraction(update, chat_id, user_id, assistant_text)
+
         u = usage_bucket(final.usage)
         alias = model_alias(model) or model
         req_cost = cost_for_model(model, u)
@@ -1214,7 +1546,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             f"{len(chunks)} messages | "
             f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out / "
             f"cache r {u['cache_read']} w {u['cache_write']} | "
-            f"${req_cost:.2f} | scenes={len(fragments)}"
+            f"${req_cost:.2f} | scenes={len(fragments)} | "
+            f"extracted={extracted} extract_cost=${extract_cost:.4f}"
         )
     except anthropic.APIError as e:
         logger.error(f"{tag} ❌ Anthropic API error: {e}")
@@ -1261,28 +1594,55 @@ async def classify_message(chat_id: int, user_text: str) -> str:
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Документы никогда не идут в модель. В режиме /import .txt и .md (UTF-8, до
+    200 КБ) становятся частью буфера; вне режима файл не принимается (раньше .txt
+    уходил прямо в Opus, мимо порога длины)."""
     if not is_allowed(update.effective_user.id):
         return
-
+    user_id = update.effective_user.id
     doc = update.message.document
-    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"):
+    name = ((doc.file_name if doc else "") or "").lower()
+    is_text_doc = name.endswith((".txt", ".md"))
+    active = import_active(user_id)
+    if await notify_import_expired(update, user_id):
         return
-
+    if not active:
+        if is_text_doc:
+            logger.info(f"[user {user_id}] 📄 document outside /import: not sent to model")
+            await update.message.reply_text(
+                "файл не отправлен в модель, чтобы не тратить деньги. "
+                "чтобы загрузить текст: /import, затем файл, затем /done"
+            )
+        return
+    if not is_text_doc:
+        await update.message.reply_text("в режиме /import принимаю только .txt и .md")
+        return
+    if doc.file_size and doc.file_size > IMPORT_DOC_MAX_BYTES:
+        await update.message.reply_text(
+            f"файл больше {IMPORT_DOC_MAX_BYTES // 1024} КБ ({doc.file_size // 1024} КБ). "
+            "раздели его на части или перешли текстом"
+        )
+        return
     try:
         file = await doc.get_file()
-        file_bytes = await file.download_as_bytearray()
-        user_text = file_bytes.decode("utf-8", errors="replace")
+        data = bytes(await file.download_as_bytearray())
     except Exception as e:
         logger.error(f"document read error: {e}")
         await alert_error("document read error", e)
         await update.message.reply_text(f"не смогла прочитать файл: {e}")
         return
-
-    caption = update.message.caption or ""
-    if caption:
-        user_text = f"{caption}\n\n{user_text}"
-
-    await _process_user_text(update, user_text)
+    if len(data) > IMPORT_DOC_MAX_BYTES:
+        await update.message.reply_text(f"файл больше {IMPORT_DOC_MAX_BYTES // 1024} КБ, не принят")
+        return
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await update.message.reply_text("файл не в UTF-8: пересохрани его в UTF-8 и пришли снова")
+        return
+    if not text.strip():
+        await update.message.reply_text("файл пустой")
+        return
+    await accept_part(update, user_id, update.message.date.timestamp(), text, True)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1294,16 +1654,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+    import_mode = import_active(user_id)
+    if await notify_import_expired(update, user_id):
+        return
     ts = forwarded_from_bot(update.message, context.bot.id)
+    if import_mode:
+        # Режим /import: любой текст (и пересылка) молча в буфер, модель не зовётся,
+        # порог MAX_INPUT_CHARS не действует.
+        when = ts if ts is not None else update.message.date.timestamp()
+        await accept_part(update, user_id, when, user_text, True)
+        return
     if ts is not None:
         # Часть сцены, пересланная от самого бота: в модель не идёт, только буфер.
-        n, is_new = add_forwarded_part(user_id, ts, user_text)
-        logger.info(
-            f"[user {user_id}] 📥 forwarded part, {n} in buffer" + ("" if is_new else " (duplicate)")
-        )
-        await update.message.reply_text(
-            f"часть {n} принята" if is_new else f"эта часть уже принята (всего {n})"
-        )
+        await accept_part(update, user_id, ts, user_text, False)
         return
 
     if len(user_text) > MAX_INPUT_CHARS:
@@ -1312,7 +1675,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             "длинный текст не отправлен в модель, чтобы не тратить деньги; "
-            "для сохранения сцены перешли её части боту и вызови /keep"
+            "для сохранения сцены: /import, части (или .txt), /done"
         )
         return
 
@@ -1450,12 +1813,17 @@ def main():
     app.add_handler(CommandHandler("keep", cmd_keep))
     app.add_handler(CommandHandler("scenes", cmd_scenes))
     app.add_handler(CommandHandler("unkeep", cmd_unkeep))
+    app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("accept", cmd_accept))
+    app.add_handler(CommandHandler("context", cmd_context))
     app.add_handler(CommandHandler("addprompt", cmd_addprompt))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("regenerate", cmd_regenerate))
     app.add_handler(CommandHandler("scene", cmd_scene))
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.add_error_handler(error_handler)

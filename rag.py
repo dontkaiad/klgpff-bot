@@ -1,7 +1,8 @@
 """RAG для фактов и памяти сцен: Voyage AI эмбеддинги + Postgres/pgvector.
 
 Таблица "facts" хранит по одной строке на факт юзера. Таблицы "scenes" и
-"scene_chunks" хранят сохранённые вручную сцены и их чанки с эмбеддингами.
+"scene_chunks" хранят сохранённые вручную сцены и их чанки с эмбеддингами,
+"fact_candidates" живущие сутки кандидаты в факты.
 При недоступности Postgres / Voyage / зависимостей функции бросают исключение —
 вызывающая сторона (claude_tg_bot) ловит и делает fallback (для фактов: полный
 список, для сцен: запрос уходит без справки).
@@ -78,6 +79,21 @@ CREATE TABLE IF NOT EXISTS scene_chunks (
 """,
     "CREATE INDEX IF NOT EXISTS scene_chunks_user_idx ON scene_chunks (user_id)",
     "CREATE INDEX IF NOT EXISTS scene_chunks_scene_idx ON scene_chunks (scene_id)",
+    # Кандидаты в факты: живут 24 часа, в facts попадают только по /accept.
+    # num это номер для /accept: счётчик на юзера (max(num)+1), не позиция среди
+    # живых строк, поэтому номера в старом сообщении не съезжают, когда сгорает
+    # более ранняя партия.
+    """
+CREATE TABLE IF NOT EXISTS fact_candidates (
+    id         bigserial   PRIMARY KEY,
+    user_id    bigint      NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    num        integer     NOT NULL,
+    text       text        NOT NULL,
+    status     text        NOT NULL DEFAULT 'pending'
+)
+""",
+    "CREATE INDEX IF NOT EXISTS fact_candidates_user_idx ON fact_candidates (user_id, num)",
 )
 
 
@@ -95,7 +111,7 @@ def _connect():
             conn.execute(stmt)
         conn.commit()
         _schema_ready = True
-        logger.info("RAG: таблицы facts, scenes, scene_chunks готовы")
+        logger.info("RAG: таблицы facts, scenes, scene_chunks, fact_candidates готовы")
     return conn
 
 
@@ -340,3 +356,115 @@ def search_scenes(user_id: int, queries: list, top_k: int = 3) -> list:
                     best[cid] = (score, number, chunk)
     top = sorted(best.values(), key=lambda v: v[0], reverse=True)[:top_k]
     return [(number, chunk) for _, number, chunk in top]
+
+
+# --- Кандидаты в факты ---
+# Срок жизни 24 часа: просроченное удаляется при любом обращении к таблице.
+_PURGE_SQL = "DELETE FROM fact_candidates WHERE created_at < now() - interval '24 hours'"
+
+
+def add_candidates(user_id: int, texts: list) -> list:
+    """Сохраняет кандидатов (status pending). Возвращает [(номер, текст)]. Номера
+    продолжают нумерацию живых кандидатов юзера."""
+    if not texts:
+        return []
+    with _connect() as conn:
+        conn.execute(_PURGE_SQL)
+        start = conn.execute(
+            "SELECT coalesce(max(num), 0) FROM fact_candidates WHERE user_id = %s", (user_id,)
+        ).fetchone()[0]
+        rows = [(user_id, start + i + 1, t) for i, t in enumerate(texts)]
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO fact_candidates (user_id, num, text) VALUES (%s, %s, %s)", rows
+            )
+    return [(num, text) for _, num, text in rows]
+
+
+def pending_candidates(user_id: int) -> list:
+    """Ожидающие подтверждения кандидаты юзера: [(номер, текст)] по номеру."""
+    with _connect() as conn:
+        conn.execute(_PURGE_SQL)
+        rows = conn.execute(
+            "SELECT num, text FROM fact_candidates WHERE user_id = %s AND status = 'pending' "
+            "ORDER BY num",
+            (user_id,),
+        ).fetchall()
+    return [(num, text) for num, text in rows]
+
+
+def claim_candidates(user_id: int, nums=None):
+    """Помечает выбранных кандидатов принятыми (nums=None: все ожидающие).
+    Возвращает (взято [(номер, текст)], уже_принятые [номера], нет_таких [номера]).
+    Один UPDATE ... RETURNING: повторный вызов с теми же номерами ничего не берёт.
+    Если запись фактов после этого не удалась, вызывающий возвращает строки через
+    release_candidates."""
+    with _connect() as conn:
+        conn.execute(_PURGE_SQL)
+        live = conn.execute(
+            "SELECT num, status FROM fact_candidates WHERE user_id = %s", (user_id,)
+        ).fetchall()
+        pending = {n for n, st in live if st == "pending"}
+        accepted = {n for n, st in live if st == "accepted"}
+        if nums is None:
+            target = sorted(pending)
+            already, missing = [], []
+        else:
+            asked = set(nums)
+            target = sorted(asked & pending)
+            already = sorted(asked & accepted)
+            missing = sorted(asked - pending - accepted)
+        claimed = []
+        if target:
+            claimed = conn.execute(
+                "UPDATE fact_candidates SET status = 'accepted' "
+                "WHERE user_id = %s AND status = 'pending' AND num = ANY(%s::int[]) "
+                "RETURNING num, text",
+                (user_id, target),
+            ).fetchall()
+    return sorted((num, text) for num, text in claimed), already, missing
+
+
+def release_candidates(user_id: int, nums: list) -> None:
+    """Откат claim_candidates, если факты записать не удалось."""
+    if not nums:
+        return
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE fact_candidates SET status = 'pending' "
+            "WHERE user_id = %s AND status = 'accepted' AND num = ANY(%s::int[])",
+            (user_id, list(nums)),
+        )
+
+
+def cosine(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def filter_similar(user_id: int, candidates: list, pending_texts: list, threshold: float) -> list:
+    """Оставляет кандидатов, у которых косинусная близость < threshold к каждому
+    существующему факту (по готовым эмбеддингам в таблице facts), к каждому
+    ожидающему кандидату и к уже оставленным в этой партии. Эмбеддинги новых
+    текстов считает Voyage одним батчем (input_type document, как у фактов)."""
+    if not candidates:
+        return []
+    vecs = _embed_batched(list(candidates) + list(pending_texts), "document")
+    cvecs, pvecs = vecs[: len(candidates)], vecs[len(candidates):]
+    kept, kept_vecs = [], []
+    with _connect() as conn:
+        for text, vec in zip(candidates, cvecs):
+            row = conn.execute(
+                "SELECT 1 - min(embedding <=> %s::vector) FROM facts WHERE user_id = %s",
+                (_vec(vec), user_id),
+            ).fetchone()
+            sim_facts = float(row[0]) if row and row[0] is not None else 0.0
+            if sim_facts >= threshold:
+                continue
+            if any(cosine(vec, other) >= threshold for other in pvecs + kept_vecs):
+                continue
+            kept.append(text)
+            kept_vecs.append(vec)
+    return kept
