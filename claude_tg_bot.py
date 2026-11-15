@@ -13,6 +13,7 @@ import json
 import os
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -65,6 +66,14 @@ FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "150"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 # Память сцен: сколько чанков сохранённых сцен подмешивать к запросу.
 SCENE_TOP_K = int(os.environ.get("SCENE_TOP_K", "3"))
+# Защита от дорогих запросов. Дневной лимит считается по расходам за сегодня
+# (дата по UTC+3, данные те же, что у /cost); 0 или меньше выключает его.
+DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "3.00"))
+# Обычное сообщение (не команда) длиннее этого в модель не уходит: длинный текст
+# это обычно сцена, вставленная частями, и каждая часть стоила бы запроса Opus.
+MAX_INPUT_CHARS = 3500
+# Части сцены, пересланные боту от него самого: сколько хранить без новых частей.
+FORWARD_BUFFER_TTL = 30 * 60
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
 # менять версию модели без правки кода.
@@ -499,13 +508,31 @@ def usage_bucket(response_usage) -> dict:
     }
 
 
+TZ_MSK = timezone(timedelta(hours=3))
+DAILY_KEEP_DAYS = 60  # сколько дней истории расходов хранить в _daily
+
+
+def today_key() -> str:
+    """Сегодняшняя дата по UTC+3, ключ в usage["_daily"]."""
+    return datetime.now(TZ_MSK).strftime("%Y-%m-%d")
+
+
+def _zero_bucket() -> dict:
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+
+
 def add_usage(chat_id: int, model: str, response_usage):
+    """Пишет токены в общий счётчик по модели и в разбивку по дням (ключ "_daily":
+    дата -> модель -> bucket). Дневная разбивка нужна для DAILY_LIMIT_USD; суммы
+    по моделям, которые читает /cost, лежат как раньше на верхнем уровне."""
     data = load_usage(chat_id)
-    bucket = data.setdefault(
-        model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-    )
-    for k, v in usage_bucket(response_usage).items():
-        bucket[k] += v
+    delta = usage_bucket(response_usage)
+    day = data.setdefault("_daily", {}).setdefault(today_key(), {})
+    for bucket in (data.setdefault(model, _zero_bucket()), day.setdefault(model, _zero_bucket())):
+        for k, v in delta.items():
+            bucket[k] += v
+    for old in sorted(data["_daily"])[:-DAILY_KEEP_DAYS]:
+        del data["_daily"][old]
     save_usage(chat_id, data)
 
 
@@ -524,13 +551,47 @@ def cost_for_model(model: str, b: dict) -> float:
     ) / 1_000_000
 
 
+def spent_today(chat_id: int) -> float:
+    """Расходы чата за сегодня (по UTC+3), $. До появления _daily (старые данные)
+    считается нулём: день деплоя начинается с чистого счёта."""
+    day = load_usage(chat_id).get("_daily", {}).get(today_key(), {})
+    return sum(cost_for_model(model, b) for model, b in day.items())
+
+
+def limit_line(chat_id: int) -> str:
+    spent = spent_today(chat_id)
+    if DAILY_LIMIT_USD <= 0:
+        return f"сегодня (UTC+3): ≈ ${spent:.2f}, дневной лимит выключен"
+    return f"сегодня (UTC+3): ≈ ${spent:.2f} из ${DAILY_LIMIT_USD:.2f} (DAILY_LIMIT_USD)"
+
+
+async def block_if_over_limit(update, chat_id: int) -> bool:
+    """True и ответ пользователю, если дневной лимит исчерпан: вызывать API нельзя.
+    Проверка стоит перед каждым входом в модель (классификатор тоже считается)."""
+    if DAILY_LIMIT_USD <= 0:
+        return False
+    spent = spent_today(chat_id)
+    if spent < DAILY_LIMIT_USD:
+        return False
+    logger.warning(
+        f"{_tag(chat_id)} 🛑 daily limit reached: ${spent:.2f} of ${DAILY_LIMIT_USD:.2f}, API not called"
+    )
+    await update.message.reply_text(
+        f"дневной лимит ${DAILY_LIMIT_USD:.2f} исчерпан (потрачено ${spent:.2f}), "
+        "поднять можно в .env: DAILY_LIMIT_USD"
+    )
+    return True
+
+
 def format_cost(chat_id: int) -> str:
     data = load_usage(chat_id)
-    if not data:
-        return "расходов пока нет."
+    if not any(not k.startswith("_") for k in data):
+        return "расходов пока нет.\n\n" + limit_line(chat_id)
     lines = []
     total = 0.0
     for model, b in data.items():
+        if model.startswith("_"):  # служебные ключи (_daily), не модели
+            continue
         cost = cost_for_model(model, b)
         total += cost
         cached_pct = (
@@ -542,7 +603,12 @@ def format_cost(chat_id: int) -> str:
             f"cache w {b['cache_write']:,} / r {b['cache_read']:,} ({cached_pct:.0f}% cached)\n"
             f"  ≈ ${cost:.3f}"
         )
-    return "💸 расходы\n\n" + "\n\n".join(lines) + f"\n\nвсего: ≈ ${total:.3f}"
+    return (
+        "💸 расходы\n\n"
+        + "\n\n".join(lines)
+        + f"\n\nвсего: ≈ ${total:.3f}\n"
+        + limit_line(chat_id)
+    )
 
 
 # --- Прочее ---
@@ -598,7 +664,7 @@ HELP_TEXT = (
     "/forget all — забыть всё\n"
     "/facts — все факты с номерами для /forget\n\n"
     "🎬 память сцен (только вручную):\n"
-    "/keep — сохранить сцену (ответом на сообщение бота, иначе последний ответ)\n"
+    "/keep — сохранить сцену (ответом на сообщение бота; пересланные боту части сцены склеит; иначе последний ответ)\n"
     "/scenes — сохранённые сцены с номерами\n"
     "/unkeep <номер> — удалить сцену\n\n"
     "⚙️ настройки:\n"
@@ -606,7 +672,7 @@ HELP_TEXT = (
     "/model — текущий режим\n"
     "/model auto — классификатор решает\n"
     "/model opus|sonnet|haiku — всегда эта модель, классификатор off (дефолт: opus)\n\n"
-    "💸 /cost — расходы по этому чату\n"
+    "💸 /cost — расходы по этому чату, за сегодня и дневной лимит\n"
     "ℹ️ /help — это сообщение"
 )
 
@@ -647,6 +713,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     conversations[update.effective_chat.id] = []
+    forward_buffers.pop(update.effective_user.id, None)
     await update.message.reply_text("контекст сброшен. факты сохранены.")
 
 
@@ -746,6 +813,69 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+# --- Части сцены, пересланные боту от него самого ---
+# Пересланные от бота сообщения в модель не идут никогда: бот складывает их в
+# буфер (в памяти процесса, свой на пользователя), /keep без ответа сохраняет
+# склеенную сцену. Буфер живёт FORWARD_BUFFER_TTL без новых частей, сбрасывается
+# по /new и после сохранения.
+forward_buffers: dict = {}  # user_id -> {"parts": [(дата, seq, текст)], "hashes", "seq", "last"}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _live_buffer(user_id: int, create: bool = False):
+    b = forward_buffers.get(user_id)
+    if b is not None and _now() - b["last"] > FORWARD_BUFFER_TTL:
+        forward_buffers.pop(user_id)
+        b = None
+    if b is None and create:
+        b = forward_buffers[user_id] = {"parts": [], "hashes": set(), "seq": 0, "last": _now()}
+    return b
+
+
+def forwarded_from_bot(msg, bot_id: int):
+    """Дата исходного сообщения (unix), если сообщение переслано от самого бота,
+    иначе None. Новый формат: forward_origin (MessageOriginUser.sender_user), его
+    отдают установленные версии PTB (22.x). Старый forward_from/forward_date в них
+    уже не приходит, проверка оставлена на случай другой версии."""
+    origin = getattr(msg, "forward_origin", None)
+    if origin is not None:
+        user = getattr(origin, "sender_user", None)
+        if getattr(origin, "type", "") == "user" and user is not None and user.id == bot_id:
+            return origin.date.timestamp()
+        return None
+    user = getattr(msg, "forward_from", None)
+    if user is not None and user.id == bot_id:
+        date = getattr(msg, "forward_date", None) or getattr(msg, "date", None)
+        return date.timestamp() if date else 0.0
+    return None
+
+
+def add_forwarded_part(user_id: int, ts: float, text: str):
+    """Кладёт часть в буфер. Возвращает (число частей, новая ли). Дубль (тот же
+    текст) не добавляется."""
+    b = _live_buffer(user_id, create=True)
+    b["last"] = _now()
+    h = rag.scene_hash(text)
+    if h in b["hashes"]:
+        return len(b["parts"]), False
+    b["hashes"].add(h)
+    b["seq"] += 1
+    b["parts"].append((ts, b["seq"], text.strip()))
+    return len(b["parts"]), True
+
+
+def buffered_parts(user_id: int) -> list:
+    """Тексты частей по дате исходного сообщения; при равной дате (даты с точностью
+    до секунды) по порядку прихода."""
+    b = _live_buffer(user_id)
+    if not b:
+        return []
+    return [t for _, _, t in sorted(b["parts"], key=lambda x: (x[0], x[1]))]
+
+
 # --- Память сцен ---
 # Префикс запроса /scene: из request для /scenes он вырезается, иначе у всех
 # сцен из /scene в списке была бы одна и та же начальная фраза.
@@ -793,11 +923,17 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     replied = getattr(update.message, "reply_to_message", None)
+    n_parts = 0
+    if replied is None:
+        parts = buffered_parts(user_id)
+        n_parts = len(parts)
     if replied is not None:
         if not (replied.from_user and replied.from_user.is_bot):
             await update.message.reply_text("ответь на сообщение бота со сценой.")
             return
         text = reply_texts.get((chat_id, replied.message_id)) or replied.text or ""
+    elif n_parts:
+        text = "\n\n".join(parts)
     else:
         text = next(
             (
@@ -824,12 +960,15 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     logger.info(
         f"[user {user_id}] 🎬 scene {number} {'saved' if created else 'duplicate'}"
-        f" ({len(text.split())} words)"
+        f" ({len(text.split())} words{f', {n_parts} parts' if n_parts else ''})"
     )
+    if n_parts:
+        forward_buffers.pop(user_id, None)  # при сбое выше буфер остаётся для повтора
+    suffix = f" (частей: {n_parts})" if n_parts else ""
     if created:
-        await update.message.reply_text(f"✓ сохранена: сцена {number}")
+        await update.message.reply_text(f"✓ сохранена: сцена {number}{suffix}")
     else:
-        await update.message.reply_text(f"уже сохранена: сцена {number}")
+        await update.message.reply_text(f"уже сохранена: сцена {number}{suffix}")
 
 
 def scenes_messages(rows: list, limit: int = FACTS_MSG_LIMIT) -> list[str]:
@@ -955,6 +1094,8 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     note = update.message.text.partition(" ")[2].strip()
     history = get_history(chat_id)
+    if await block_if_over_limit(update, chat_id):
+        return
     if not history or history[-1]["role"] != "assistant":
         await update.message.reply_text(
             "нечего перегенерить — нет последнего ответа."
@@ -987,6 +1128,8 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    if await block_if_over_limit(update, chat_id):
+        return
     wrapped = f"{SCENE_PROMPT_PREFIX}{desc}"
     history = get_history(chat_id)
     history.append({"role": "user", "content": wrapped})
@@ -1003,6 +1146,8 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _generate_and_reply(update, chat_id, user_id, history, model_override=None):
     tag = _tag(chat_id)
+    if await block_if_over_limit(update, chat_id):
+        return
     base_prompt = load_prompt(chat_id)
     facts, fact_source = get_relevant_facts(user_id, history)
     canon = build_canon_block(facts)
@@ -1148,12 +1293,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+    user_id = update.effective_user.id
+    ts = forwarded_from_bot(update.message, context.bot.id)
+    if ts is not None:
+        # Часть сцены, пересланная от самого бота: в модель не идёт, только буфер.
+        n, is_new = add_forwarded_part(user_id, ts, user_text)
+        logger.info(
+            f"[user {user_id}] 📥 forwarded part, {n} in buffer" + ("" if is_new else " (duplicate)")
+        )
+        await update.message.reply_text(
+            f"часть {n} принята" if is_new else f"эта часть уже принята (всего {n})"
+        )
+        return
+
+    if len(user_text) > MAX_INPUT_CHARS:
+        logger.warning(
+            f"[user {user_id}] long text not sent to model: {len(user_text)} chars > {MAX_INPUT_CHARS}"
+        )
+        await update.message.reply_text(
+            "длинный текст не отправлен в модель, чтобы не тратить деньги; "
+            "для сохранения сцены перешли её части боту и вызови /keep"
+        )
+        return
+
     await _process_user_text(update, user_text)
 
 
 async def _process_user_text(update: Update, user_text: str):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    if await block_if_over_limit(update, chat_id):
+        return  # до истории и классификатора: в историю запрос не попадает
     history = get_history(chat_id)
     history.append({"role": "user", "content": user_text})
     history = trim_history(history)
