@@ -443,5 +443,100 @@ class AcceptTests(Base2):
         self.assertEqual(self.read_facts(111)[2:], ["кандидат 1", "кандидат 4"])
 
 
+# ------------------------------------------------ обрезанный ответ (stop_reason=max_tokens)
+class SalvageTests(unittest.TestCase):
+    def test_complete_elements_survive_and_the_cut_one_is_dropped(self):
+        raw = '{"new_facts":["факт 1","факт 2","факт 3 обор'
+        self.assertEqual(extract.salvage_truncated(raw), (["факт 1", "факт 2"], []))
+
+    def test_both_arrays(self):
+        raw = '{"new_facts":["факт 1","факт 2"],"conflicts":["конфликт 1","конфликт 2 обор'
+        self.assertEqual(extract.salvage_truncated(raw), (["факт 1", "факт 2"], ["конфликт 1"]))
+
+    def test_object_conflicts_cut_in_the_middle_are_dropped(self):
+        raw = '{"new_facts":["факт 1"],"conflicts":[{"fact":"факт 3","quote":"цитата"},{"fact":"факт 4","quo'
+        self.assertEqual(extract.salvage_truncated(raw), (["факт 1"], ["факт 3 — цитата"]))
+
+    def test_escaped_quotes_and_fences(self):
+        raw = '```json\n{"new_facts":["он сказал \\"да\\"","факт 2","оборв'
+        self.assertEqual(extract.salvage_truncated(raw), (['он сказал "да"', "факт 2"], []))
+
+    def test_nothing_complete_gives_none(self):
+        for raw in ('{"new_facts":["факт', '{"new_facts":[', "", None, "просто текст", '{"conflicts":[{"fact":"x'):
+            self.assertIsNone(extract.salvage_truncated(raw), raw)
+
+    def test_limits_still_apply(self):
+        raw = '{"new_facts":[' + ",".join(f'"факт {i}"' for i in range(12)) + ',"обор'
+        self.assertEqual(len(extract.salvage_truncated(raw)[0]), 8)
+
+    def test_prompt_asks_for_compact_json_with_limits(self):
+        for piece in ("компактный JSON", "до 15 слов", "не больше 8", "conflicts не больше 5"):
+            self.assertIn(piece, extract.EXTRACT_SYSTEM)
+
+
+class TruncationFlowTests(Base2):
+    def generate(self, text=None):
+        self.stream_text = text or words(300)
+        return self.say(111, "напиши сцену")
+
+    def test_default_max_tokens_is_3000_and_is_passed_to_the_model(self):
+        self.assertEqual(bot.EXTRACT_MAX_TOKENS, 3000)
+        self.generate()
+        self.assertEqual(self.extraction_calls()[0].kwargs["max_tokens"], 3000)
+
+    def test_partial_json_is_parsed_with_a_warning_and_without_a_user_error(self):
+        self.extract_stop = "max_tokens"
+        self.extract_reply = '{"new_facts":["факт 1","факт 2","факт 3 обор'
+        with self.assertLogs(bot.logger, level="WARNING") as cm:
+            out = self.generate()
+        self.assertEqual(len(self.extraction_calls()), 1)  # повторного вызова нет
+        self.assertIn("1. факт 1\n2. факт 2", out[-1])
+        self.assertNotIn("оборвалось", "\n".join(out))
+        self.assertNotIn("факт 3", out[-1])
+        self.assertTrue(any("обрезан" in l and "взяты полные элементы: 2" in l for l in cm.output), cm.output)
+
+    def test_nothing_to_salvage_tells_the_user_once_and_does_not_retry(self):
+        self.extract_stop = "max_tokens"
+        self.extract_reply = '{"new_facts":["факт 1 обор'
+        with self.assertLogs(bot.logger, level="WARNING") as cm:
+            out = self.generate()
+        self.assertEqual(out[0], words(300))  # сцена дошла
+        self.assertEqual(out[1:], ["извлечение фактов оборвалось, попробуй /done ещё раз"])
+        self.assertEqual(len(self.extraction_calls()), 1)  # автоповтора нет
+        self.assertTrue(any("обрезан" in l and "достать нечего" in l for l in cm.output))
+        self.assertEqual(self.cands.rows, {})
+        self.assertGreater(bot.spent_today(111), 0)  # потраченное учтено
+
+    def test_done_command_reports_the_truncation_too(self):
+        self.command(bot.cmd_import, 111, "/import")
+        self.run_handler(bot.handle_message, 111, words(20))
+        self.extract_stop = "max_tokens"
+        self.extract_reply = "{"
+        out = self.command(bot.cmd_done, 111, "/done")
+        self.assertEqual(out[-1], "извлечение фактов оборвалось, попробуй /done ещё раз")
+        self.assertEqual(len(self.extraction_calls()), 1)
+
+    def test_truncated_flag_with_a_complete_json_is_a_normal_answer(self):
+        self.extract_stop = "max_tokens"
+        self.extract_reply = extraction_json(["факт 1", "факт 2"])
+        out = self.generate()
+        self.assertIn("1. факт 1\n2. факт 2", out[-1])
+        self.assertNotIn("оборвалось", "\n".join(out))
+
+    def test_unparsable_answer_that_is_not_truncated_stays_silent(self):
+        self.extract_reply = "{не json"
+        with self.assertLogs(bot.logger, level="WARNING") as cm:
+            out = self.generate()
+        self.assertEqual(out, [words(300)])
+        self.assertTrue(any("не разобран" in l for l in cm.output))
+
+    def test_done_log_counts_zero_extracted_for_a_failed_extraction(self):
+        self.extract_stop = "max_tokens"
+        self.extract_reply = "{"
+        with self.assertLogs(bot.logger, level="INFO") as cm:
+            self.generate()
+        self.assertIn("extracted=0", next(l for l in cm.output if "done:" in l))
+
+
 if __name__ == "__main__":
     unittest.main()

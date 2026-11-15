@@ -105,6 +105,7 @@ class Base2(Base):
             d.mkdir()
         self.stream_text = "ответ"
         self.extract_reply = extraction_json([])
+        self.extract_stop = "end_turn"  # "max_tokens" имитирует обрезанный ответ
         self.index_facts = mock.Mock()
         for p in (
             mock.patch.object(bot, "FACTS_DIR", self.facts_dir),
@@ -133,7 +134,8 @@ class Base2(Base):
 
     def _create(self, **kw):
         text = self.extract_reply if kw.get("system") == extract.EXTRACT_SYSTEM else "opus"
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], usage=self.usage)
+        stop = self.extract_stop if kw.get("system") == extract.EXTRACT_SYSTEM else "end_turn"
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], usage=self.usage, stop_reason=stop)
 
     # --- помощники
     def extraction_calls(self):

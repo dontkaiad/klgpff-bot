@@ -21,7 +21,8 @@ EXTRACT_SYSTEM = (
     "Формулируй в стиле существующих фактов, нейтрально, без откровенных подробностей. "
     "Не включай разовые события сюжета. "
     "conflicts: места, где текст противоречит канону (факт и короткая цитата до 12 слов). "
-    "Ответ: только JSON, без пояснений."
+    "Ответ: только компактный JSON без пояснений, лишних пробелов и переносов строк. "
+    "Факты короткие (до 15 слов), не больше 8; conflicts не больше 5 элементов."
 )
 
 
@@ -45,6 +46,36 @@ def _json_object(raw: str):
         if isinstance(obj, dict):
             return obj
     return None
+
+
+def _complete_items(raw: str, key: str) -> list:
+    """Полностью записанные элементы массива "key": [...] из обрезанного ответа.
+    Элемент, оборванный на середине, отбрасывается."""
+    m = re.search(r'"%s"\s*:\s*\[' % re.escape(key), raw or "")
+    if not m:
+        return []
+    decoder = json.JSONDecoder()
+    pos, items = m.end(), []
+    while pos < len(raw):
+        while pos < len(raw) and raw[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(raw) or raw[pos] == "]":
+            break
+        try:
+            item, pos = decoder.raw_decode(raw, pos)
+        except ValueError:
+            break
+        items.append(item)
+    return items
+
+
+def salvage_truncated(raw: str):
+    """(new_facts, conflicts) из ответа, оборванного по max_tokens: берутся только
+    полные элементы обоих массивов. None, если не нашлось ни одного."""
+    found = {"new_facts": _complete_items(raw, "new_facts"), "conflicts": _complete_items(raw, "conflicts")}
+    if not found["new_facts"] and not found["conflicts"]:
+        return None
+    return parse_extraction(json.dumps(found, ensure_ascii=False))
 
 
 def _clean(value, limit: int) -> str:

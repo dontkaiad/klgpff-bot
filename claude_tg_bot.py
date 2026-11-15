@@ -85,7 +85,13 @@ EXTRACT_ENABLED = os.environ.get("EXTRACT_ENABLED", "true").strip().lower() not 
 EXTRACT_MIN_WORDS = int(os.environ.get("EXTRACT_MIN_WORDS", "300"))
 SIM_DEDUP = float(os.environ.get("SIM_DEDUP", "0.92"))  # косинус, с которого кандидат считается дублем
 EXTRACT_MAX_INPUT_CHARS = 60000
-EXTRACT_MAX_TOKENS = 1500
+EXTRACT_MAX_TOKENS = int(os.environ.get("EXTRACT_MAX_TOKENS", "3000"))  # ответ обрезался на 1500
+# Окно вставки: Telegram режет длинную вставку на много сообщений. После отказа по порогу
+# MAX_INPUT_CHARS следующие обычные сообщения этого же юзера в течение PASTE_WINDOW_SECONDS
+# (скользящее: каждое продлевает) тоже не идут в модель, иначе хвост короче порога уходит в Opus.
+# 0 выключает окно. Два обычных сообщения с интервалом меньше PASTE_FAST_SECONDS открывают его же.
+PASTE_WINDOW_SECONDS = float(os.environ.get("PASTE_WINDOW_SECONDS", "15"))
+PASTE_FAST_SECONDS = 1.0
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
 # менять версию модели без правки кода.
@@ -1232,7 +1238,24 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
         )
         add_usage(chat_id, EXTRACT_MODEL, resp.usage)  # идёт в /cost и в дневной лимит
         cost = cost_for_model(EXTRACT_MODEL, usage_bucket(resp.usage))
-        parsed = extract.parse_extraction(response_text(resp))
+        raw = response_text(resp)
+        truncated = getattr(resp, "stop_reason", None) == "max_tokens"
+        parsed = extract.parse_extraction(raw)
+        if parsed is None and truncated:
+            # Ответ оборвался по max_tokens: берём полные элементы JSON. Повторный вызов
+            # автоматически не делаем (это ещё деньги), пользователю говорим один раз.
+            parsed = extract.salvage_truncated(raw)
+            if parsed is None:
+                logger.warning(
+                    f"{_tag(chat_id)} extraction: ответ обрезан (max_tokens={EXTRACT_MAX_TOKENS}), "
+                    "достать нечего"
+                )
+                await update.message.reply_text("извлечение фактов оборвалось, попробуй /done ещё раз")
+                return 0, cost
+            logger.warning(
+                f"{_tag(chat_id)} extraction: ответ обрезан (max_tokens={EXTRACT_MAX_TOKENS}), "
+                f"взяты полные элементы: {len(parsed[0])} фактов, {len(parsed[1])} противоречий"
+            )
         if parsed is None:
             logger.warning(f"{_tag(chat_id)} extraction: ответ модели не разобран, пропуск")
             return 0, cost
@@ -1645,6 +1668,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await accept_part(update, user_id, update.message.date.timestamp(), text, True)
 
 
+# user_id -> {"until": конец окна (unix), "count": сколько сообщений отклонено, "last": дата
+# предыдущего обычного сообщения}. Время берётся из даты сообщения Telegram, а не из момента
+# обработки: пока бот ждёт ответ модели, очередь стоит, и по часам обработки окно бы не работало.
+paste_state: dict = {}
+
+
+def paste_check(user_id: int, ts: float, too_long: bool) -> str:
+    """Что делать с обычным текстовым сообщением: "pass" (в модель), "reject_long"
+    (длиннее порога, ответ пользователю), "reject_paste" (вторая вставка подряд, ответ
+    пользователю) или "swallow" (внутри окна, молча). Отклонение открывает или продлевает окно."""
+    if PASTE_WINDOW_SECONDS <= 0:
+        return "reject_long" if too_long else "pass"
+    st = paste_state.setdefault(user_id, {"until": 0.0, "count": 0, "last": None})
+    fast = st["last"] is not None and 0 <= ts - st["last"] < PASTE_FAST_SECONDS
+    st["last"] = ts
+    if ts < st["until"]:
+        st["until"] = ts + PASTE_WINDOW_SECONDS
+        st["count"] += 1
+        return "swallow"
+    if too_long or fast:
+        st["until"] = ts + PASTE_WINDOW_SECONDS
+        st["count"] = 1
+        return "reject_long" if too_long else "reject_paste"
+    return "pass"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -1669,12 +1718,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await accept_part(update, user_id, ts, user_text, False)
         return
 
-    if len(user_text) > MAX_INPUT_CHARS:
+    date = getattr(update.message, "date", None)
+    verdict = paste_check(
+        user_id, date.timestamp() if date else _now(), len(user_text) > MAX_INPUT_CHARS
+    )
+    if verdict == "swallow":
+        # Продолжение вставки: молча, одна строка в лог со счётчиком, без текста.
+        logger.info(
+            f"[user {user_id}] paste window: message swallowed "
+            f"(#{paste_state[user_id]['count']}, {len(user_text)} chars)"
+        )
+        return
+    if verdict == "reject_long":
         logger.warning(
-            f"[user {user_id}] long text not sent to model: {len(user_text)} chars > {MAX_INPUT_CHARS}"
+            f"[user {user_id}] long text not sent to model: {len(user_text)} chars > {MAX_INPUT_CHARS}; "
+            f"paste window {PASTE_WINDOW_SECONDS:g}s opened"
         )
         await update.message.reply_text(
             "длинный текст не отправлен в модель, чтобы не тратить деньги; "
+            "для сохранения сцены: /import, части (или .txt), /done"
+        )
+        return
+    if verdict == "reject_paste":
+        logger.warning(
+            f"[user {user_id}] several messages in a row not sent to model; "
+            f"paste window {PASTE_WINDOW_SECONDS:g}s opened"
+        )
+        await update.message.reply_text(
+            "несколько сообщений подряд не отправлены в модель, чтобы не тратить деньги; "
             "для сохранения сцены: /import, части (или .txt), /done"
         )
         return

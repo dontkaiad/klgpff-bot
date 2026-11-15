@@ -51,6 +51,8 @@ class Base(unittest.TestCase):
         bot.conversations.clear()
         bot.reply_texts.clear()
         bot.forward_buffers.clear()
+        bot.paste_state.clear()
+        self._clock = 0  # дата сообщения по умолчанию растёт: подряд идущие сообщения не выглядят вставкой
         for p in (
             mock.patch.object(bot, "ALLOWED_USER_IDS", set(ALLOWED)),
             mock.patch.object(bot, "USAGE_DIR", self.tmp),
@@ -78,6 +80,10 @@ class Base(unittest.TestCase):
             content=[SimpleNamespace(type="text", text="opus")], usage=final.usage
         )
 
+    def _next_date(self):
+        self._clock += 100
+        return at(self._clock)
+
     def update(self, user_id, text, forward_origin=None, **extra):
         replies = []
 
@@ -90,7 +96,7 @@ class Base(unittest.TestCase):
 
         message = SimpleNamespace(
             text=text, reply_text=reply_text, reply_to_message=None, forward_origin=forward_origin,
-            date=extra.pop("date", at(0)), **extra,
+            date=extra.pop("date", None) or self._next_date(), **extra,
         )
         upd = SimpleNamespace(
             effective_user=SimpleNamespace(id=user_id),
