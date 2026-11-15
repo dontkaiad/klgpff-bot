@@ -333,6 +333,18 @@ def get_scene_summary(user_id: int, number: int):
     return created, request, (summary or None), words
 
 
+def get_scene_text(user_id: int, number: int):
+    """Полный текст сцены с порядковым номером number (с единицы) или None, если её нет."""
+    if number < 1:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT text FROM scenes WHERE user_id = %s ORDER BY id OFFSET %s LIMIT 1",
+            (user_id, number - 1),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def set_summary(user_id: int, number: int, summary: str) -> bool:
     """Записывает выжимку сцене с порядковым номером number. False, если сцены нет."""
     with _connect() as conn:

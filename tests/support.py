@@ -106,6 +106,7 @@ class Base2(Base):
         self.stream_text = "ответ"
         self.extract_reply = extraction_json([])
         self.extract_stop = "end_turn"  # "max_tokens" имитирует обрезанный ответ
+        self.extract_blocks = ("text",)  # типы блоков ответа извлечения, напр. ("thinking", "text")
         self.summary_reply = "выжимка сцены"
         self.summary_stop = "end_turn"
         self.index_facts = mock.Mock()
@@ -141,7 +142,9 @@ class Base2(Base):
                                    usage=self.usage, stop_reason=self.summary_stop)
         text = self.extract_reply if system == extract.EXTRACT_SYSTEM else "opus"
         stop = self.extract_stop if system == extract.EXTRACT_SYSTEM else "end_turn"
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], usage=self.usage, stop_reason=stop)
+        types = self.extract_blocks if system == extract.EXTRACT_SYSTEM else ("text",)
+        blocks = [SimpleNamespace(type="text", text=text) if t == "text" else SimpleNamespace(type=t) for t in types]
+        return SimpleNamespace(content=blocks, usage=self.usage, stop_reason=stop)
 
     # --- помощники
     def summary_calls(self):

@@ -501,7 +501,7 @@ class TruncationFlowTests(Base2):
         with self.assertLogs(bot.logger, level="WARNING") as cm:
             out = self.generate()
         self.assertEqual(out[0], words(300))  # сцена дошла
-        self.assertEqual(out[1:], ["извлечение фактов оборвалось, попробуй /done ещё раз"])
+        self.assertEqual(out[1:], ["извлечение фактов оборвалось: сохрани сцену командой /keep и запусти /extract <номер>"])
         self.assertEqual(len(self.extraction_calls()), 1)  # автоповтора нет
         self.assertTrue(any("обрезан" in l and "достать нечего" in l for l in cm.output))
         self.assertEqual(self.cands.rows, {})
@@ -513,7 +513,7 @@ class TruncationFlowTests(Base2):
         self.extract_stop = "max_tokens"
         self.extract_reply = "{"
         out = self.command(bot.cmd_done, 111, "/done")
-        self.assertEqual(out[-1], "извлечение фактов оборвалось, попробуй /done ещё раз")
+        self.assertEqual(out[-1], "извлечение фактов оборвалось, попробуй /extract 1")  # сцена сохранена под номером 1
         self.assertEqual(len(self.extraction_calls()), 1)
 
     def test_truncated_flag_with_a_complete_json_is_a_normal_answer(self):

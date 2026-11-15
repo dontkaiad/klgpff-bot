@@ -76,6 +76,11 @@ STORY_MAX_CHARS = int(os.environ.get("STORY_MAX_CHARS", "12000"))
 SUMMARY_MAX_TOKENS = 800
 SUMMARY_MAX_CHARS = 1500  # страховка: ответ длиннее обрезается
 SUMMARY_MAX_INPUT_CHARS = 60000
+# Вспомогательные вызовы (выжимка, извлечение фактов) идут на Haiku 5.5, у которого размышление по
+# умолчанию включено и его токены входят в max_tokens: на извлечении весь лимит уходил на размышление
+# и JSON не появлялся (stop_reason=max_tokens, 15.11.2026). По умолчанию размышление выключено.
+# AUX_THINKING=adaptive возвращает поведение модели по умолчанию.
+AUX_THINKING = os.environ.get("AUX_THINKING", "disabled").strip().lower()
 # Защита от дорогих запросов. Дневной лимит считается по расходам за сегодня
 # (дата по UTC+3, данные те же, что у /cost); 0 или меньше выключает его.
 DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "2.00"))
@@ -764,7 +769,8 @@ HELP_TEXT = (
     "/import — режим приёма: присылай части, пересылки или .txt/.md файл\n"
     "/done — сохранить принятое как сцену и найти кандидатов в факты\n"
     "/cancel — выйти из режима без сохранения\n"
-    "/accept <номера|all> — принять кандидатов в факты\n\n"
+    "/accept <номера|all> — принять кандидатов в факты\n"
+    "/extract <номер> — повторить поиск кандидатов в факты для сохранённой сцены\n\n"
     "🎬 память сцен (только вручную, по умолчанию не подмешивается):\n"
     "/keep — сохранить сцену (ответом на сообщение бота; пересланные боту части сцены склеит; иначе последний ответ)\n"
     "/scenes — сохранённые сцены с номерами; /scenes N — выжимка сцены N\n"
@@ -793,6 +799,7 @@ BOT_COMMANDS = [
     ("done", "сохранить принятый текст как сцену"),
     ("cancel", "выйти из режима /import без сохранения"),
     ("accept", "принять кандидатов в факты: номера или all"),
+    ("extract", "повторить поиск кандидатов в факты для сцены N"),
     ("context", "что уйдёт в модель; scenes on|off"),
     ("addprompt", "добавить к существующему промпту"),
     ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
@@ -1274,7 +1281,9 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     head = "✓ сохранена" if created else "уже сохранена"
     await update.message.reply_text(f"{head}: сцена {number} (частей: {len(parts)}, слов: {words})")
     await summarize_saved_scene(update, chat_id, user_id, number, created, text)
-    extracted, cost = await run_extraction(update, chat_id, user_id, text, notify_empty=True)
+    extracted, cost = await run_extraction(
+        update, chat_id, user_id, text, notify_empty=True, scene_number=number, notify_failure=True
+    )
     logger.info(f"[user {user_id}] 📥 import extract: extracted={extracted} extract_cost=${cost:.4f}")
 
 
@@ -1294,7 +1303,31 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"импорт отменён, буфер очищен (частей: {k}). ничего не сохранено.")
 
 
-async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_empty: bool = False):
+def aux_call_kwargs() -> dict:
+    """Параметры размышления для вспомогательных вызовов (см. AUX_THINKING)."""
+    return {} if AUX_THINKING == "adaptive" else {"thinking": {"type": "disabled"}}
+
+
+def describe_response(resp) -> str:
+    """Служебные поля ответа для лога: stop_reason, токены, типы блоков (text/thinking).
+    Без текста ответа."""
+    u = usage_bucket(resp.usage)
+    blocks = ",".join(getattr(b, "type", "?") for b in resp.content) or "none"
+    return f"stop={getattr(resp, 'stop_reason', None)} in={u['input']} out={u['output']} blocks={blocks}"
+
+
+def extraction_cut_message(scene_number) -> str:
+    """Подсказка при оборванном ответе извлечения: после /done буфера уже нет, поэтому
+    ведём на /extract (у сцены, которую ещё не сохранили, сначала /keep)."""
+    if scene_number:
+        return f"извлечение фактов оборвалось, попробуй /extract {scene_number}"
+    return "извлечение фактов оборвалось: сохрани сцену командой /keep и запусти /extract <номер>"
+
+
+async def run_extraction(
+    update, chat_id: int, user_id: int, text: str, notify_empty: bool = False,
+    scene_number=None, notify_failure: bool = False,
+):
     """Один вызов EXTRACT_MODEL: кандидаты в факты и противоречия канону. Идёт после
     отправки сцены, результат отдельным сообщением без LLM. Возвращает (сколько
     кандидатов показано, стоимость $). Никогда не бросает: любой сбой это warning
@@ -1314,9 +1347,11 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
                 max_tokens=EXTRACT_MAX_TOKENS,
                 system=extract.EXTRACT_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
+                **aux_call_kwargs(),
             )
         )
         add_usage(chat_id, EXTRACT_MODEL, resp.usage)  # идёт в /cost и в дневной лимит
+        logger.info(f"{_tag(chat_id)} extraction call: {describe_response(resp)}")
         cost = cost_for_model(EXTRACT_MODEL, usage_bucket(resp.usage))
         raw = response_text(resp)
         truncated = getattr(resp, "stop_reason", None) == "max_tokens"
@@ -1330,7 +1365,7 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
                     f"{_tag(chat_id)} extraction: ответ обрезан (max_tokens={EXTRACT_MAX_TOKENS}), "
                     "достать нечего"
                 )
-                await update.message.reply_text("извлечение фактов оборвалось, попробуй /done ещё раз")
+                await update.message.reply_text(extraction_cut_message(scene_number))
                 return 0, cost
             logger.warning(
                 f"{_tag(chat_id)} extraction: ответ обрезан (max_tokens={EXTRACT_MAX_TOKENS}), "
@@ -1338,6 +1373,8 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
             )
         if parsed is None:
             logger.warning(f"{_tag(chat_id)} extraction: ответ модели не разобран, пропуск")
+            if notify_failure:
+                await update.message.reply_text("извлечение фактов не получилось: ответ модели не разобран, подробности в логе")
             return 0, cost
         new_facts, conflicts = parsed
         pending = [t for _, t in rag.pending_candidates(user_id)]
@@ -1357,6 +1394,11 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
         return len(numbered), cost
     except Exception as e:
         logger.warning(f"{_tag(chat_id)} extraction failed: {e!r}")
+        if notify_failure:
+            try:
+                await update.message.reply_text("извлечение фактов не получилось, подробности в логе")
+            except Exception:
+                pass
         return 0, cost
 
 
@@ -1383,9 +1425,11 @@ async def make_summary(chat_id: int, text: str):
                 max_tokens=SUMMARY_MAX_TOKENS,
                 system=SUMMARY_SYSTEM,
                 messages=[{"role": "user", "content": text[:SUMMARY_MAX_INPUT_CHARS]}],
+                **aux_call_kwargs(),
             )
         )
         add_usage(chat_id, SUMMARY_MODEL, resp.usage)
+        logger.info(f"{_tag(chat_id)} summary call: {describe_response(resp)}")
         cost = cost_for_model(SUMMARY_MODEL, usage_bucket(resp.usage))
         if getattr(resp, "stop_reason", None) == "max_tokens":
             logger.warning(f"{_tag(chat_id)} summary: ответ обрезан (max_tokens={SUMMARY_MAX_TOKENS})")
@@ -1420,6 +1464,40 @@ async def summarize_saved_scene(update, chat_id: int, user_id: int, number: int,
     except Exception as e:
         logger.warning(f"[user {user_id}] summary: запись не удалась: {e!r}")
     await update.message.reply_text("выжимка не получилась")
+
+
+async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/extract <номер>: повторно запускает извлечение кандидатов в факты для уже сохранённой
+    сцены (номер как в /scenes). Один вызов EXTRACT_MODEL, результат как после /done."""
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    arg = update.message.text.partition(" ")[2].strip()
+    try:
+        number = int(arg)
+    except ValueError:
+        await update.message.reply_text("напиши номер сцены из /scenes: /extract 1")
+        return
+    try:
+        text = rag.get_scene_text(user_id, number)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] /extract {number}: БД недоступна: {e!r}")
+        await update.message.reply_text("память сцен недоступна. попробуй позже.")
+        return
+    if text is None:
+        await update.message.reply_text(f"сцены {number} нет, список: /scenes")
+        return
+    if not EXTRACT_ENABLED:
+        await update.message.reply_text("извлечение фактов выключено (EXTRACT_ENABLED=false).")
+        return
+    if await block_if_over_limit(update, chat_id):
+        return
+    await update.message.reply_text(f"извлекаю кандидатов в факты из сцены {number}...")
+    extracted, cost = await run_extraction(
+        update, chat_id, user_id, text, notify_empty=True, scene_number=number, notify_failure=True
+    )
+    logger.info(f"[user {user_id}] 🧠 /extract scene {number}: extracted={extracted} extract_cost=${cost:.4f}")
 
 
 def _fact_numbers(first: int, k: int) -> str:
@@ -2056,6 +2134,7 @@ def main():
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("accept", cmd_accept))
+    app.add_handler(CommandHandler("extract", cmd_extract))
     app.add_handler(CommandHandler("context", cmd_context))
     app.add_handler(CommandHandler("addprompt", cmd_addprompt))
     app.add_handler(CommandHandler("model", cmd_model))

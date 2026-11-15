@@ -289,6 +289,12 @@ class FakeStore:
         s = items[number - 1]
         return datetime.datetime(2026, 11, 15, 12, 0), s["request"], s.get("summary"), len(s["text"].split())
 
+    def get_scene_text(self, user_id, number):
+        if self.fail:
+            raise RuntimeError("db down")
+        items = self.scenes.get(user_id, [])
+        return items[number - 1]["text"] if 1 <= number <= len(items) else None
+
     def set_summary(self, user_id, number, summary):
         if self.fail:
             raise RuntimeError("db down")

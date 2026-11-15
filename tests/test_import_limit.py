@@ -67,6 +67,7 @@ class Base(unittest.TestCase):
             mock.patch.object(bot.rag, "search_scenes", return_value=[]),
             mock.patch.object(bot.rag, "get_scene_summary", side_effect=self.store.get_scene_summary),
             mock.patch.object(bot.rag, "set_summary", side_effect=self.store.set_summary),
+            mock.patch.object(bot.rag, "get_scene_text", side_effect=self.store.get_scene_text),
             mock.patch.object(bot.rag, "story_chronicle", side_effect=self.store.story_chronicle),
         ):
             p.start()
