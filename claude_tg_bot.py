@@ -62,6 +62,8 @@ RAG_MAX_FACTS = int(os.environ.get("RAG_MAX_FACTS", "50"))
 # Пока фактов не больше этого порога — отдаём все без поиска (0 = RAG всегда).
 FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "150"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
+# Память сцен: сколько чанков сохранённых сцен подмешивать к запросу.
+SCENE_TOP_K = int(os.environ.get("SCENE_TOP_K", "3"))
 
 # Алиасы для /model → конкретные API model ID. ID берутся из .env, чтобы
 # менять версию модели без правки кода.
@@ -301,6 +303,39 @@ def get_relevant_facts(user_id: int, history: list[dict]):
         return all_facts, "fallback — vector DB unavailable"
 
 
+def get_memory_scenes(user_id: int, history: list[dict]) -> list:
+    """Фрагменты сохранённых сцен для текущего запроса: [(номер, текст)].
+    Те же поисковые запросы, что у фактов. Сцен нет, поиск выключен или упал: []
+    и запрос уходит как раньше (при сбое warning в лог, без текста запроса)."""
+    if SCENE_TOP_K < 1:
+        return []
+    queries = retrieval_queries(history)
+    if not queries:
+        return []
+    try:
+        return rag.search_scenes(user_id, queries, top_k=SCENE_TOP_K)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] память сцен: поиск не удался, без справки: {e!r}")
+        return []
+
+
+def build_scenes_block(fragments: list) -> str:
+    """Справка из сохранённых сцен. Идёт в хвост последнего user-сообщения сразу
+    после канона. Это не канон: при расхождении прав канон."""
+    if not fragments:
+        return ""
+    body = "\n\n".join(f"[сцена {n}]\n{text}" for n, text in fragments)
+    return (
+        "<memory_scenes>\n"
+        "Фрагменты ранее сохранённых сцен автора. Это не канон. Если они "
+        "противоречат <canon>, прав канон. Используй для преемственности "
+        "(события, интонация, детали отношений), не пересказывай и не копируй "
+        "дословно.\n\n"
+        f"{body}\n"
+        "</memory_scenes>"
+    )
+
+
 # --- Промпты ---
 def prompt_path(chat_id: int) -> Path:
     return PROMPTS_DIR / f"{chat_id}.txt"
@@ -341,10 +376,11 @@ def build_canon_block(facts: list[str]) -> str:
     )
 
 
-def build_messages(history: list[dict], canon: str) -> list[dict]:
-    """Копия истории для API: канон дописан к последнему user-сообщению, а на
-    последнем ответе ассистента стоит cache-breakpoint (кешируется всё до него).
-    Сама история в памяти остаётся чистой — канон в неё не пишется."""
+def build_messages(history: list[dict], canon: str, scenes: str = "") -> list[dict]:
+    """Копия истории для API: канон, а за ним справка из сцен (memory_scenes)
+    дописаны к последнему user-сообщению, на последнем ответе ассистента стоит
+    cache-breakpoint (кешируется всё до него). Сама история в памяти остаётся
+    чистой — канон и сцены в неё не пишутся."""
     msgs = [dict(m) for m in history]
     if not msgs:
         return msgs
@@ -353,6 +389,8 @@ def build_messages(history: list[dict], canon: str) -> list[dict]:
         text = last["content"] if isinstance(last["content"], str) else ""
         if canon:
             text = f"{text}\n\n{canon}"
+        if scenes:
+            text = f"{text}\n\n{scenes}"
         last["content"] = text
     if len(msgs) >= 2 and msgs[-2]["role"] == "assistant":
         prev = msgs[-2]
@@ -503,7 +541,7 @@ def format_cost(chat_id: int) -> str:
             f"cache w {b['cache_write']:,} / r {b['cache_read']:,} ({cached_pct:.0f}% cached)\n"
             f"  ≈ ${cost:.3f}"
         )
-    return f"💸 расходы\n\n" + "\n\n".join(lines) + f"\n\nвсего: ≈ ${total:.3f}"
+    return "💸 расходы\n\n" + "\n\n".join(lines) + f"\n\nвсего: ≈ ${total:.3f}"
 
 
 # --- Прочее ---
@@ -558,6 +596,10 @@ HELP_TEXT = (
     "/forget <номер> — забыть по номеру\n"
     "/forget all — забыть всё\n"
     "/facts — все факты с номерами для /forget\n\n"
+    "🎬 память сцен (только вручную):\n"
+    "/keep — сохранить сцену (ответом на сообщение бота, иначе последний ответ)\n"
+    "/scenes — сохранённые сцены с номерами\n"
+    "/unkeep <номер> — удалить сцену\n\n"
     "⚙️ настройки:\n"
     "/addprompt <текст> — добавить к существующему\n"
     "/model — текущий режим\n"
@@ -574,6 +616,9 @@ BOT_COMMANDS = [
     ("remember", "запомнить факт о персонаже"),
     ("forget", "забыть факт по номеру или всё"),
     ("facts", "показать все факты с номерами"),
+    ("keep", "сохранить сцену в память (ответом на сообщение бота)"),
+    ("scenes", "сохранённые сцены с номерами"),
+    ("unkeep", "удалить сохранённую сцену по номеру"),
     ("addprompt", "добавить к существующему промпту"),
     ("model", "режим модели (по умолчанию opus; auto включает роутер)"),
     ("cost", "расходы по этому чату"),
@@ -700,6 +745,157 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+# --- Память сцен ---
+# Префикс запроса /scene: из request для /scenes он вырезается, иначе у всех
+# сцен из /scene в списке была бы одна и та же начальная фраза.
+SCENE_PROMPT_PREFIX = (
+    "Напиши длинную атмосферную сцену. Используй все факты о персонажах. "
+    "Минимум 1500 слов. Описание сцены: "
+)
+SCENE_LIST_REQUEST_CHARS = 60
+
+# Ответ бота, ушедший в Telegram несколькими сообщениями: message_id каждой части
+# → полный текст ответа. Нужен, чтобы /keep ответом на любую часть взял сцену
+# целиком. Только в памяти процесса (как и история): после рестарта /keep берёт
+# одно сообщение. Строка общая для всех частей, копий нет.
+REPLY_TEXTS_MAX = 200
+reply_texts: dict = {}
+
+
+def remember_reply_parts(chat_id: int, message_ids: list, full_text: str):
+    for mid in message_ids:
+        reply_texts[(chat_id, mid)] = full_text
+    while len(reply_texts) > REPLY_TEXTS_MAX:
+        reply_texts.pop(next(iter(reply_texts)))
+
+
+def request_for(history: list[dict], text: str) -> str:
+    """Запрос юзера, на который бот ответил этим текстом: user-сообщение прямо
+    перед ответом из истории. Нет такого ответа в истории: первые 60 символов
+    самого текста."""
+    for i in range(len(history) - 1, 0, -1):
+        m = history[i]
+        if m["role"] == "assistant" and m["content"] == text:
+            prev = history[i - 1]
+            if prev["role"] == "user" and isinstance(prev["content"], str):
+                req = prev["content"]
+                if req.startswith(SCENE_PROMPT_PREFIX):
+                    req = req[len(SCENE_PROMPT_PREFIX):]
+                return " ".join(req.split())
+            break
+    return " ".join(text.split())[:60]
+
+
+async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    replied = getattr(update.message, "reply_to_message", None)
+    if replied is not None:
+        if not (replied.from_user and replied.from_user.is_bot):
+            await update.message.reply_text("ответь на сообщение бота со сценой.")
+            return
+        text = reply_texts.get((chat_id, replied.message_id)) or replied.text or ""
+    else:
+        text = next(
+            (
+                m["content"]
+                for m in reversed(get_history(chat_id))
+                if m["role"] == "assistant" and isinstance(m["content"], str)
+            ),
+            "",
+        )
+    if not text.strip():
+        await update.message.reply_text(
+            "нечего сохранять: ответь командой /keep на сообщение со сценой."
+        )
+        return
+    request = request_for(get_history(chat_id), text)
+    try:
+        number, created = rag.save_scene(user_id, request, text)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] /keep: сохранить не удалось: {e!r}")
+        await send_log(f"⚠️ klgpff /keep failed: {e!r}")
+        await update.message.reply_text(
+            "не удалось сохранить: БД или Voyage недоступны. попробуй позже."
+        )
+        return
+    logger.info(
+        f"[user {user_id}] 🎬 scene {number} {'saved' if created else 'duplicate'}"
+        f" ({len(text.split())} words)"
+    )
+    if created:
+        await update.message.reply_text(f"✓ сохранена: сцена {number}")
+    else:
+        await update.message.reply_text(f"уже сохранена: сцена {number}")
+
+
+def scenes_messages(rows: list, limit: int = FACTS_MSG_LIMIT) -> list[str]:
+    """Нумерованный список сцен «N. дата · request · слов», нарезанный на
+    сообщения по границам строк (строка не рвётся). rows: [(created_at, request,
+    слов)] в порядке номеров; номер это позиция с единицы, то же число принимает
+    /unkeep и стоит в метках «сцена N» в промпте."""
+    lines = []
+    for i, (created, request, words) in enumerate(rows):
+        req = " ".join(request.split())[:SCENE_LIST_REQUEST_CHARS]
+        lines.append(f"{i + 1}. {created:%d.%m.%Y} · {req} · {words} сл.")
+    chunks: list[str] = []
+    cur = ""
+    for line in lines:
+        block = f"{cur}\n{line}" if cur else line
+        if len(block) <= limit:
+            cur = block
+        else:
+            chunks.append(cur)
+            cur = line
+    if cur:
+        chunks.append(cur)
+    if chunks:
+        chunks[0] = "🎬 сцены:\n\n" + chunks[0]
+    return chunks
+
+
+async def cmd_scenes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    try:
+        rows = rag.list_scenes(update.effective_user.id)
+    except Exception as e:
+        logger.warning(f"/scenes: БД недоступна: {e!r}")
+        await update.message.reply_text("память сцен недоступна. попробуй позже.")
+        return
+    if not rows:
+        await update.message.reply_text("пусто. сохрани сцену командой /keep")
+        return
+    for chunk in scenes_messages(rows):
+        await update.message.reply_text(chunk)
+
+
+async def cmd_unkeep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    arg = update.message.text.partition(" ")[2].strip()
+    try:
+        number = int(arg)
+    except ValueError:
+        await update.message.reply_text("напиши номер из /scenes: /unkeep 3")
+        return
+    try:
+        deleted = rag.delete_scene(user_id, number)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] /unkeep: БД недоступна: {e!r}")
+        await update.message.reply_text("память сцен недоступна. попробуй позже.")
+        return
+    if deleted:
+        await update.message.reply_text(
+            f"удалена: сцена {number}. номера после неё сдвинулись, см. /scenes"
+        )
+    else:
+        await update.message.reply_text(f"сцены {number} нет, список: /scenes")
+
+
 async def cmd_addprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -790,10 +986,7 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    wrapped = (
-        "Напиши длинную атмосферную сцену. Используй все факты о персонажах. "
-        f"Минимум 1500 слов. Описание сцены: {desc}"
-    )
+    wrapped = f"{SCENE_PROMPT_PREFIX}{desc}"
     history = get_history(chat_id)
     history.append({"role": "user", "content": wrapped})
     history = trim_history(history)
@@ -812,6 +1005,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     base_prompt = load_prompt(chat_id)
     facts, fact_source = get_relevant_facts(user_id, history)
     canon = build_canon_block(facts)
+    fragments = get_memory_scenes(user_id, history)
+    scenes_block = build_scenes_block(fragments)
     model = model_override or load_model(chat_id)
     facts_chars = len(canon)
 
@@ -837,7 +1032,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             model=model,
             max_tokens=MAX_TOKENS,
             system=system_block(base_prompt),
-            messages=build_messages(history, canon),
+            messages=build_messages(history, canon, scenes_block),
         ) as stream:
             final = stream.get_final_message()
         assistant_text = response_text(final)
@@ -863,8 +1058,12 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         conversations[chat_id] = trim_history(history)
 
         chunks = split_by_paragraphs(assistant_text)
+        sent_ids = []
         for chunk in chunks:
-            await update.message.reply_text(chunk)
+            sent = await update.message.reply_text(chunk)
+            if getattr(sent, "message_id", None) is not None:
+                sent_ids.append(sent.message_id)
+        remember_reply_parts(chat_id, sent_ids, assistant_text)
 
         u = usage_bucket(final.usage)
         alias = model_alias(model) or model
@@ -874,7 +1073,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             f"{len(chunks)} messages | "
             f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out / "
             f"cache r {u['cache_read']} w {u['cache_write']} | "
-            f"${req_cost:.2f}"
+            f"${req_cost:.2f} | scenes={len(fragments)}"
         )
     except anthropic.APIError as e:
         logger.error(f"{tag} ❌ Anthropic API error: {e}")
@@ -1066,6 +1265,9 @@ def main():
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("facts", cmd_facts))
+    app.add_handler(CommandHandler("keep", cmd_keep))
+    app.add_handler(CommandHandler("scenes", cmd_scenes))
+    app.add_handler(CommandHandler("unkeep", cmd_unkeep))
     app.add_handler(CommandHandler("addprompt", cmd_addprompt))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("cost", cmd_cost))

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import claude_tg_bot as bot  # noqa: E402
 
-KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget", "facts"}
+KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget", "facts", "keep", "scenes", "unkeep"}
 REMOVED = {"system", "summarize", "setsystem"}
 
 
@@ -40,6 +40,29 @@ class CommandSetTests(unittest.TestCase):
         menu = {c for c, _ in bot.BOT_COMMANDS}
         self.assertTrue(menu.isdisjoint(REMOVED))
         self.assertTrue(menu <= KEPT)
+
+
+class HandlerRegistrationTests(unittest.TestCase):
+    """CommandHandler("x", cmd_x) в main(): имя команды, имя функции и меню сходятся."""
+
+    def setUp(self):
+        src = (Path(__file__).resolve().parent.parent / "claude_tg_bot.py").read_text(encoding="utf-8")
+        self.pairs = re.findall(r'CommandHandler\("(\w+)", (\w+)\)', src)
+
+    def test_every_handler_name_exists_and_matches_command(self):
+        self.assertTrue(self.pairs)
+        for cmd, func in self.pairs:
+            self.assertEqual(func, f"cmd_{cmd}")
+            self.assertTrue(callable(getattr(bot, func, None)), func)
+
+    def test_registered_commands_are_exactly_the_kept_set(self):
+        self.assertEqual({c for c, _ in self.pairs}, KEPT)
+
+    def test_menu_and_help_cover_every_command_except_start(self):
+        menu = {c for c, _ in bot.BOT_COMMANDS}
+        self.assertEqual(menu, KEPT - {"start"})
+        listed = set(re.findall(r"^/(\w+)", bot.HELP_TEXT.replace("💸 ", "").replace("ℹ️ ", ""), re.M))
+        self.assertEqual(listed, KEPT - {"start"})
 
 
 class LogCommandTests(unittest.TestCase):
