@@ -18,7 +18,10 @@ jobs:
             set -e
             cd ~/heylark/klgpff-bot
             git pull
-            docker compose up -d --build klgpff-bot
+            # --wait: the step succeeds only once the healthcheck (fresh /tmp/heartbeat) is healthy;
+            # a crash-looping or unhealthy container fails the run (and sends the "deploy failed"
+            # message) instead of ending green. start_period 40s + one 30s probe, so 90s is ample.
+            docker compose up -d --build --wait --wait-timeout 90 klgpff-bot
             docker compose ps
 
       # Ops-group messages through the shared action dontkaiad/ops-notify (a public copy of
