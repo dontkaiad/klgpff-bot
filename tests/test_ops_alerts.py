@@ -227,5 +227,36 @@ class ErrorHandlerTests(unittest.TestCase):
         self.assertIsNone(re.search(r"alert_\w+\([^)]*!r", src))   # repr исключения в алерты не идёт
 
 
+class RegisterCommandsTests(unittest.TestCase):
+    """post_init не должен ронять процесс, если Telegram не отвечает на set_my_commands."""
+
+    def _run(self, set_cmds):
+        app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_cmds),
+                              create_task=mock.MagicMock(side_effect=lambda coro: coro.close()))
+        warns = []
+
+        async def fake_warn(title, exc=None, body=""):
+            warns.append((title, exc, body))
+
+        with mock.patch.object(bot, "alert_warn", fake_warn):
+            asyncio.run(bot.register_commands(app))
+        return app, warns
+
+    def test_timeout_does_not_kill_startup(self):
+        async def boom(_cmds):
+            raise tgerr.TimedOut("Timed out")
+        app, warns = self._run(boom)
+        app.create_task.assert_called_once()                 # heartbeat запущен, бот работает
+        self.assertEqual(len(warns), 1)
+        self.assertIsInstance(warns[0][1], tgerr.TimedOut)   # в алерт уходит класс, не текст
+
+    def test_success_is_silent_and_starts_heartbeat(self):
+        async def ok(_cmds):
+            return True
+        app, warns = self._run(ok)
+        app.create_task.assert_called_once()
+        self.assertEqual(warns, [])
+
+
 if __name__ == "__main__":
     unittest.main()

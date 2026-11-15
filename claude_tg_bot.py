@@ -1771,7 +1771,15 @@ async def heartbeat_loop():
 
 
 async def register_commands(app: Application):
-    await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+    # Меню команд обновляется при каждом старте, но оно не стоит работы бота: если Telegram не
+    # ответил (TimedOut на set_my_commands бывает, когда сам Telegram подвисает на этом методе),
+    # исключение из post_init убивало процесс, и docker перезапускал его по кругу. Теперь
+    # остаётся прежнее меню, бот работает, в ops-группу уходит одно предупреждение (только класс).
+    try:
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+    except Exception as e:
+        logger.warning("set_my_commands failed, the command menu was not refreshed: %r", e)
+        await alert_warn("меню команд не обновлено (set_my_commands), бот работает", e)
     # PTB-tracked task: держит strong-ref (без GC-гонки голого create_task) и
     # отменяется при shutdown'е приложения.
     app.create_task(heartbeat_loop())
