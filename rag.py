@@ -2,7 +2,8 @@
 
 Таблица "facts" хранит по одной строке на факт юзера. Таблицы "scenes" и
 "scene_chunks" хранят сохранённые вручную сцены и их чанки с эмбеддингами,
-"fact_candidates" живущие сутки кандидаты в факты.
+"fact_candidates" живущие сутки кандидаты в факты. В "scenes" есть колонка summary:
+выжимка сцены для хроники сюжета.
 При недоступности Postgres / Voyage / зависимостей функции бросают исключение —
 вызывающая сторона (claude_tg_bot) ловит и делает fallback (для фактов: полный
 список, для сцен: запрос уходит без справки).
@@ -67,6 +68,8 @@ CREATE TABLE IF NOT EXISTS scenes (
     UNIQUE (user_id, text_hash)
 )
 """,
+    # Выжимка сцены (хроника сюжета). Миграция для баз, где scenes уже есть.
+    "ALTER TABLE scenes ADD COLUMN IF NOT EXISTS summary text",
     f"""
 CREATE TABLE IF NOT EXISTS scene_chunks (
     id          bigserial PRIMARY KEY,
@@ -299,16 +302,60 @@ def save_scene(user_id: int, request: str, text: str):
 
 
 def list_scenes(user_id: int) -> list:
-    """Сцены юзера по порядку сохранения: [(created_at, request, слов)]. Позиция в
-    списке с единицы это номер сцены для /scenes, /unkeep и меток «сцена N»."""
+    """Сцены юзера по порядку сохранения: [(created_at, request, слов, есть_выжимка)].
+    Позиция в списке с единицы это номер сцены для /scenes, /unkeep и меток в промпте."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT created_at, request, "
-            "cardinality(regexp_split_to_array(btrim(text), '\\s+')) "
+            "cardinality(regexp_split_to_array(btrim(text), '\\s+')), "
+            "coalesce(summary, '') <> '' "
             "FROM scenes WHERE user_id = %s ORDER BY id",
             (user_id,),
         ).fetchall()
-    return [(created, request, words) for created, request, words in rows]
+    return [(created, request, words, bool(has)) for created, request, words, has in rows]
+
+
+def get_scene_summary(user_id: int, number: int):
+    """(created_at, request, выжимка или None, слов) сцены с порядковым номером number
+    (с единицы) или None, если такой сцены нет."""
+    if number < 1:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT created_at, request, summary, "
+            "cardinality(regexp_split_to_array(btrim(text), '\\s+')) "
+            "FROM scenes WHERE user_id = %s ORDER BY id OFFSET %s LIMIT 1",
+            (user_id, number - 1),
+        ).fetchone()
+    if row is None:
+        return None
+    created, request, summary, words = row
+    return created, request, (summary or None), words
+
+
+def set_summary(user_id: int, number: int, summary: str) -> bool:
+    """Записывает выжимку сцене с порядковым номером number. False, если сцены нет."""
+    with _connect() as conn:
+        row = conn.execute(
+            "UPDATE scenes SET summary = %s WHERE user_id = %s AND id = ("
+            "SELECT id FROM scenes WHERE user_id = %s ORDER BY id OFFSET %s LIMIT 1"
+            ") RETURNING id",
+            (summary, user_id, user_id, number - 1),
+        ).fetchone()
+    return row is not None
+
+
+def story_chronicle(user_id: int) -> list:
+    """Хроника сюжета: [(номер сцены, выжимка)] по порядку сохранения, только сцены с
+    выжимкой. Номер это порядковый номер среди всех сцен юзера (как в /scenes)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT n, summary FROM ("
+            "SELECT row_number() OVER (ORDER BY id) AS n, summary FROM scenes WHERE user_id = %s"
+            ") t WHERE coalesce(summary, '') <> '' ORDER BY n",
+            (user_id,),
+        ).fetchall()
+    return [(int(n), summary) for n, summary in rows]
 
 
 def delete_scene(user_id: int, number: int) -> bool:

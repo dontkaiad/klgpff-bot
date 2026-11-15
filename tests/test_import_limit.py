@@ -65,6 +65,9 @@ class Base(unittest.TestCase):
             mock.patch.object(bot, "load_prompt", return_value="системный промпт"),
             mock.patch.object(bot, "get_relevant_facts", return_value=([], "none")),
             mock.patch.object(bot.rag, "search_scenes", return_value=[]),
+            mock.patch.object(bot.rag, "get_scene_summary", side_effect=self.store.get_scene_summary),
+            mock.patch.object(bot.rag, "set_summary", side_effect=self.store.set_summary),
+            mock.patch.object(bot.rag, "story_chronicle", side_effect=self.store.story_chronicle),
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -274,7 +277,8 @@ class ForwardImportRealStorageTests(Base):
 
         parts = ["\n\n".join(paragraph(1000 * k + 100 * i, 150) for i in range(3)) for k in range(4)]
         with mock.patch.object(rag, "_connect", lambda: FakeConn(log, on_sql)), \
-                mock.patch.object(rag, "_embed", embed):
+                mock.patch.object(rag, "_embed", embed), \
+                mock.patch.object(bot.rag, "set_summary", return_value=True):  # сцена записана в фейковую БД
             for k in (2, 0, 3, 1):  # вперемешку
                 self.forward(111, parts[k], 10 + k)
             out = self.run_handler(bot.cmd_keep, 111, "/keep")
@@ -284,7 +288,10 @@ class ForwardImportRealStorageTests(Base):
         expected = [p for part in parts for p in paras_of(part)]  # порядок дат: 0, 1, 2, 3
         self.assertEqual([p for r in rows for p in paras_of(r[3])], expected)
         self.assertIn(("document", len(rows)), [e for e in log if len(e) == 2])
-        self.assert_model_untouched()
+        # модель вызывалась только за выжимкой сохранённой сцены: ни генерации, ни роутера
+        self.client.messages.stream.assert_not_called()
+        self.assertEqual({c.kwargs.get("system") for c in self.client.messages.create.call_args_list},
+                         {bot.SUMMARY_SYSTEM})
 
 
 # ------------------------------------------------------- 2. защита от расходов

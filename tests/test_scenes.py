@@ -276,9 +276,32 @@ class FakeStore:
         if self.fail:
             raise RuntimeError("db down")
         return [
-            (datetime.datetime(2026, 11, 15, 12, 0), s["request"], len(s["text"].split()))
+            (datetime.datetime(2026, 11, 15, 12, 0), s["request"], len(s["text"].split()), bool(s.get("summary")))
             for s in self.scenes.get(user_id, [])
         ]
+
+    def get_scene_summary(self, user_id, number):
+        if self.fail:
+            raise RuntimeError("db down")
+        items = self.scenes.get(user_id, [])
+        if not 1 <= number <= len(items):
+            return None
+        s = items[number - 1]
+        return datetime.datetime(2026, 11, 15, 12, 0), s["request"], s.get("summary"), len(s["text"].split())
+
+    def set_summary(self, user_id, number, summary):
+        if self.fail:
+            raise RuntimeError("db down")
+        items = self.scenes.get(user_id, [])
+        if not 1 <= number <= len(items):
+            return False
+        items[number - 1]["summary"] = summary
+        return True
+
+    def story_chronicle(self, user_id):
+        if self.fail:
+            raise RuntimeError("db down")
+        return [(i + 1, s["summary"]) for i, s in enumerate(self.scenes.get(user_id, [])) if s.get("summary")]
 
     def delete_scene(self, user_id, number):
         if self.fail:
@@ -295,8 +318,20 @@ class CommandBase(unittest.TestCase):
         self.store = FakeStore()
         bot.conversations.clear()
         bot.reply_texts.clear()
+        self.client = mock.Mock()
+        self.client.messages.create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="выжимка сцены")],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0),
+            stop_reason="end_turn",
+        )
         for p in (
             mock.patch.object(bot, "ALLOWED_USER_IDS", set(ALLOWED)),
+            mock.patch.object(bot, "client", self.client),
+            mock.patch.object(bot, "add_usage"),
+            mock.patch.object(bot, "over_daily_limit", return_value=False),
+            mock.patch.object(bot.rag, "get_scene_summary", side_effect=self.store.get_scene_summary),
+            mock.patch.object(bot.rag, "set_summary", side_effect=self.store.set_summary),
+            mock.patch.object(bot.rag, "story_chronicle", side_effect=self.store.story_chronicle),
             mock.patch.object(bot.rag, "save_scene", side_effect=self.store.save_scene),
             mock.patch.object(bot.rag, "list_scenes", side_effect=self.store.list_scenes),
             mock.patch.object(bot.rag, "delete_scene", side_effect=self.store.delete_scene),
@@ -337,13 +372,13 @@ class KeepTests(CommandBase):
     def test_without_reply_keeps_last_assistant_message_with_its_request(self):
         self.talk(111, [("запрос 1", "сцена 1"), ("запрос 2", "сцена 2")])
         self.assertEqual(self.call(bot.cmd_keep, 111, "/keep"), ["✓ сохранена: сцена 1"])
-        self.assertEqual(self.store.scenes[111], [{"request": "запрос 2", "text": "сцена 2"}])
+        self.assertEqual([(s["request"], s["text"]) for s in self.store.scenes[111]], [("запрос 2", "сцена 2")])
 
     def test_reply_to_bot_message_keeps_that_message(self):
         self.talk(111, [("запрос 1", "сцена 1"), ("запрос 2", "сцена 2")])
         out = self.call(bot.cmd_keep, 111, "/keep", reply_to=bot_message(5, "сцена 1"))
         self.assertEqual(out, ["✓ сохранена: сцена 1"])
-        self.assertEqual(self.store.scenes[111], [{"request": "запрос 1", "text": "сцена 1"}])
+        self.assertEqual([(s["request"], s["text"]) for s in self.store.scenes[111]], [("запрос 1", "сцена 1")])
 
     def test_unknown_reply_text_uses_first_60_chars_as_request(self):
         long_text = "слово " * 40
@@ -419,7 +454,7 @@ class NumberingTests(CommandBase):
         for i, line in enumerate(lines, 1):
             self.assertIn(f"запрос {i}", line)
             self.assertIn("15.11.2026", line)
-            self.assertIn("2 сл.", line)
+            self.assertIn("2 сл. · выжимка есть", line)  # /keep сохраняет и выжимку
 
     def test_unkeep_removes_the_scene_listed_under_that_number(self):
         self.keep_three()
@@ -449,13 +484,13 @@ class NumberingTests(CommandBase):
         self.assertNotIn("\n", req)
 
     def test_listing_splits_at_line_boundaries_without_loss(self):
-        rows = [(datetime.datetime(2026, 11, 15), f"запрос {i}", 100 + i) for i in range(1, 201)]
+        rows = [(datetime.datetime(2026, 11, 15), f"запрос {i}", 100 + i, False) for i in range(1, 201)]
         chunks = bot.scenes_messages(rows, limit=500)
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(c) <= 500 + len("🎬 сцены:\n\n") for c in chunks))
         lines = [l for c in chunks for l in c.splitlines() if re.match(r"^\d+\. ", l)]
         self.assertEqual([int(l.split(".")[0]) for l in lines], list(range(1, 201)))
-        self.assertTrue(all(l.endswith(" сл.") for l in lines))  # ни одна строка не порвана
+        self.assertTrue(all(l.endswith(" сл. · без выжимки") for l in lines))  # ни одна строка не порвана
 
     def test_storage_failure_gives_message_not_crash(self):
         self.store.fail = True
@@ -570,6 +605,7 @@ class GenerateTests(unittest.TestCase):
             mock.patch.object(bot, "send_alert", new=mock.AsyncMock()),
             mock.patch.object(bot, "SCENE_TOP_K", 3),
             mock.patch.object(bot, "scenes_enabled", return_value=True),  # по умолчанию память сцен выключена
+            mock.patch.object(bot.rag, "story_chronicle", return_value=[]),
         ):
             p.start()
             self.addCleanup(p.stop)

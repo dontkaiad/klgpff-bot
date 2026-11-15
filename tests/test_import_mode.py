@@ -304,9 +304,10 @@ class ScenesDefaultOffTests(ImportBase):
     def setUp(self):
         super().setUp()
         self.search = mock.Mock(return_value=list(self.FRAGMENTS))
-        p = mock.patch.object(bot.rag, "search_scenes", self.search)
-        p.start()
-        self.addCleanup(p.stop)
+        for p in (mock.patch.object(bot.rag, "search_scenes", self.search),
+                  mock.patch.object(bot, "SCENE_TOP_K", 3)):  # фрагменты по умолчанию выключены (0)
+            p.start()
+            self.addCleanup(p.stop)
 
     def last_request(self):
         return self.client.messages.stream.call_args.kwargs["messages"][-1]["content"]
@@ -365,7 +366,7 @@ class ContextTests(ImportBase):
 
     def test_scenes_line_follows_the_switch(self):
         self.ctx("/context scenes on")
-        self.assertIn(f"память сцен: вкл (до {bot.SCENE_TOP_K} фрагментов", self.ctx())
+        self.assertIn("память сцен: вкл, сохранено сцен", self.ctx())
 
     def test_facts_line_when_search_is_on(self):
         self.write_facts(111, [f"факт {i}" for i in range(5)] + ["📌 закреплённый"])

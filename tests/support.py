@@ -106,6 +106,8 @@ class Base2(Base):
         self.stream_text = "ответ"
         self.extract_reply = extraction_json([])
         self.extract_stop = "end_turn"  # "max_tokens" имитирует обрезанный ответ
+        self.summary_reply = "выжимка сцены"
+        self.summary_stop = "end_turn"
         self.index_facts = mock.Mock()
         for p in (
             mock.patch.object(bot, "FACTS_DIR", self.facts_dir),
@@ -133,11 +135,18 @@ class Base2(Base):
         self.client.messages.create.side_effect = self._create
 
     def _create(self, **kw):
-        text = self.extract_reply if kw.get("system") == extract.EXTRACT_SYSTEM else "opus"
-        stop = self.extract_stop if kw.get("system") == extract.EXTRACT_SYSTEM else "end_turn"
+        system = kw.get("system")
+        if system == bot.SUMMARY_SYSTEM:
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.summary_reply)],
+                                   usage=self.usage, stop_reason=self.summary_stop)
+        text = self.extract_reply if system == extract.EXTRACT_SYSTEM else "opus"
+        stop = self.extract_stop if system == extract.EXTRACT_SYSTEM else "end_turn"
         return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], usage=self.usage, stop_reason=stop)
 
     # --- помощники
+    def summary_calls(self):
+        return [c for c in self.client.messages.create.call_args_list if c.kwargs.get("system") == bot.SUMMARY_SYSTEM]
+
     def extraction_calls(self):
         return [c for c in self.client.messages.create.call_args_list if c.kwargs.get("system") == extract.EXTRACT_SYSTEM]
 

@@ -67,7 +67,15 @@ RAG_MAX_FACTS = int(os.environ.get("RAG_MAX_FACTS", "50"))
 FACTS_FULL_LIMIT = int(os.environ.get("FACTS_FULL_LIMIT", "150"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32000"))
 # Память сцен: сколько чанков сохранённых сцен подмешивать к запросу.
-SCENE_TOP_K = int(os.environ.get("SCENE_TOP_K", "3"))
+# Память сцен подмешивается, только когда включена (/context scenes on): хроника сюжета из
+# выжимок (STORY_*) и, если SCENE_TOP_K > 0, ещё фрагменты сцен. Фрагменты по умолчанию выключены.
+SCENE_TOP_K = int(os.environ.get("SCENE_TOP_K", "0"))
+STORY_MAX_SCENES = int(os.environ.get("STORY_MAX_SCENES", "30"))
+STORY_MAX_CHARS = int(os.environ.get("STORY_MAX_CHARS", "12000"))
+# Выжимка сцены при сохранении (/done, /keep): один вызов SUMMARY_MODEL, до 150 слов.
+SUMMARY_MAX_TOKENS = 800
+SUMMARY_MAX_CHARS = 1500  # страховка: ответ длиннее обрезается
+SUMMARY_MAX_INPUT_CHARS = 60000
 # Защита от дорогих запросов. Дневной лимит считается по расходам за сегодня
 # (дата по UTC+3, данные те же, что у /cost); 0 или меньше выключает его.
 DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "2.00"))
@@ -102,6 +110,7 @@ MODELS = {
 }
 CLASSIFIER_MODEL = MODELS["haiku"]
 EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL") or MODELS["haiku"]
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL") or MODELS["haiku"]
 
 # Цены ($ за 1M токенов): input, output, cache write 5min, cache read.
 # Ключи — алиасы (opus/sonnet/haiku), а не ID: при смене версии в .env
@@ -384,6 +393,52 @@ def build_scenes_block(fragments: list) -> str:
     )
 
 
+def select_chronicle(items: list):
+    """Хроника для блока: самые свежие выжимки, что помещаются в STORY_MAX_SCENES сцен и
+    STORY_MAX_CHARS символов. items: [(номер, выжимка)] по порядку сохранения. Возвращает
+    (выбранные в том же порядке, сколько ранних не вошло)."""
+    chosen, used = [], 0
+    for number, summary in reversed(items):
+        size = len(f"{number}. {summary}") + 1
+        if len(chosen) >= STORY_MAX_SCENES or used + size > STORY_MAX_CHARS:
+            break
+        chosen.append((number, summary))
+        used += size
+    chosen.reverse()
+    return chosen, len(items) - len(chosen)
+
+
+def build_story_block(items: list) -> str:
+    """Хроника сюжета: выжимки сохранённых сцен по порядку сохранения. Идёт в хвост
+    последнего user-сообщения после канона. Нет выжимок: пусто, запрос как раньше."""
+    chosen, skipped = select_chronicle(items)
+    if not chosen:
+        return ""
+    note = f"(ранних сцен не вошло в хронику: {skipped})\n" if skipped else ""
+    body = "\n".join(f"{n}. {summary}" for n, summary in chosen)
+    return (
+        "<story_so_far>\n"
+        "Хроника ранее сохранённых сцен автора по порядку. Это не канон. Если она противоречит "
+        "<canon>, прав канон. Продолжай сюжет с учётом событий и развития отношений, не "
+        "повторяй сцены и не пересказывай их.\n"
+        f"{note}\n"
+        f"{body}\n"
+        "</story_so_far>"
+    )
+
+
+def get_story(user_id: int) -> list:
+    """Выжимки для хроники: [(номер, выжимка)]. Память сцен выключена (по умолчанию), лимиты
+    нулевые, сцен или выжимок нет, БД упала: [] и запрос уходит как раньше."""
+    if STORY_MAX_SCENES < 1 or STORY_MAX_CHARS < 1 or not scenes_enabled(user_id):
+        return []
+    try:
+        return rag.story_chronicle(user_id)
+    except Exception as e:
+        logger.warning(f"[user {user_id}] хроника: не удалось получить выжимки, без неё: {e!r}")
+        return []
+
+
 # --- Промпты ---
 def prompt_path(chat_id: int) -> Path:
     return PROMPTS_DIR / f"{chat_id}.txt"
@@ -424,9 +479,9 @@ def build_canon_block(facts: list[str]) -> str:
     )
 
 
-def build_messages(history: list[dict], canon: str, scenes: str = "") -> list[dict]:
-    """Копия истории для API: канон, а за ним справка из сцен (memory_scenes)
-    дописаны к последнему user-сообщению, на последнем ответе ассистента стоит
+def build_messages(history: list[dict], canon: str, scenes: str = "", story: str = "") -> list[dict]:
+    """Копия истории для API: канон, за ним хроника сюжета (story_so_far) и справка из
+    сцен (memory_scenes) дописаны к последнему user-сообщению, на последнем ответе ассистента стоит
     cache-breakpoint (кешируется всё до него). Сама история в памяти остаётся
     чистой — канон и сцены в неё не пишутся."""
     msgs = [dict(m) for m in history]
@@ -435,10 +490,9 @@ def build_messages(history: list[dict], canon: str, scenes: str = "") -> list[di
     last = msgs[-1]
     if last["role"] == "user":
         text = last["content"] if isinstance(last["content"], str) else ""
-        if canon:
-            text = f"{text}\n\n{canon}"
-        if scenes:
-            text = f"{text}\n\n{scenes}"
+        for block in (canon, story, scenes):  # порядок: канон, хроника, фрагменты
+            if block:
+                text = f"{text}\n\n{block}"
         last["content"] = text
     if len(msgs) >= 2 and msgs[-2]["role"] == "assistant":
         prev = msgs[-2]
@@ -713,7 +767,7 @@ HELP_TEXT = (
     "/accept <номера|all> — принять кандидатов в факты\n\n"
     "🎬 память сцен (только вручную, по умолчанию не подмешивается):\n"
     "/keep — сохранить сцену (ответом на сообщение бота; пересланные боту части сцены склеит; иначе последний ответ)\n"
-    "/scenes — сохранённые сцены с номерами\n"
+    "/scenes — сохранённые сцены с номерами; /scenes N — выжимка сцены N\n"
     "/unkeep <номер> — удалить сцену\n\n"
     "⚙️ настройки:\n"
     "/context — что уйдёт в модель; /context scenes on|off — память сцен\n"
@@ -733,7 +787,7 @@ BOT_COMMANDS = [
     ("forget", "забыть факт по номеру или всё"),
     ("facts", "показать все факты с номерами"),
     ("keep", "сохранить сцену в память (ответом на сообщение бота)"),
-    ("scenes", "сохранённые сцены с номерами"),
+    ("scenes", "сохранённые сцены; /scenes N: выжимка"),
     ("unkeep", "удалить сохранённую сцену по номеру"),
     ("import", "режим приёма: части сцены или .txt, в конце /done"),
     ("done", "сохранить принятый текст как сцену"),
@@ -1076,17 +1130,19 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✓ сохранена: сцена {number}{suffix}")
     else:
         await update.message.reply_text(f"уже сохранена: сцена {number}{suffix}")
+    await summarize_saved_scene(update, chat_id, user_id, number, created, text)
 
 
 def scenes_messages(rows: list, limit: int = FACTS_MSG_LIMIT) -> list[str]:
     """Нумерованный список сцен «N. дата · request · слов», нарезанный на
     сообщения по границам строк (строка не рвётся). rows: [(created_at, request,
-    слов)] в порядке номеров; номер это позиция с единицы, то же число принимает
-    /unkeep и стоит в метках «сцена N» в промпте."""
+    слов, есть_выжимка)] в порядке номеров; номер это позиция с единицы, то же число
+    принимает /unkeep и /scenes N."""
     lines = []
-    for i, (created, request, words) in enumerate(rows):
+    for i, (created, request, words, has_summary) in enumerate(rows):
         req = " ".join(request.split())[:SCENE_LIST_REQUEST_CHARS]
-        lines.append(f"{i + 1}. {created:%d.%m.%Y} · {req} · {words} сл.")
+        mark = "выжимка есть" if has_summary else "без выжимки"
+        lines.append(f"{i + 1}. {created:%d.%m.%Y} · {req} · {words} сл. · {mark}")
     chunks: list[str] = []
     cur = ""
     for line in lines:
@@ -1105,6 +1161,29 @@ def scenes_messages(rows: list, limit: int = FACTS_MSG_LIMIT) -> list[str]:
 
 async def cmd_scenes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
+        return
+    arg = update.message.text.partition(" ")[2].strip()
+    if arg:
+        # /scenes N: выжимка сцены N (без полного текста), без вызова модели
+        try:
+            number = int(arg)
+        except ValueError:
+            await update.message.reply_text("напиши номер из /scenes: /scenes 3")
+            return
+        try:
+            info = rag.get_scene_summary(update.effective_user.id, number)
+        except Exception as e:
+            logger.warning(f"/scenes {number}: БД недоступна: {e!r}")
+            await update.message.reply_text("память сцен недоступна. попробуй позже.")
+            return
+        if info is None:
+            await update.message.reply_text(f"сцены {number} нет, список: /scenes")
+            return
+        created, request, summary, words = info
+        req = " ".join(request.split())[:SCENE_LIST_REQUEST_CHARS]
+        head = f"сцена {number} · {created:%d.%m.%Y} · {req} · {words} сл."
+        body = summary or "выжимки нет: сцена сохранена без неё"
+        await update.message.reply_text(f"{head}\n\n📖 выжимка (проверь, нет ли выдумок):\n{body}")
         return
     try:
         rows = rag.list_scenes(update.effective_user.id)
@@ -1194,6 +1273,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     head = "✓ сохранена" if created else "уже сохранена"
     await update.message.reply_text(f"{head}: сцена {number} (частей: {len(parts)}, слов: {words})")
+    await summarize_saved_scene(update, chat_id, user_id, number, created, text)
     extracted, cost = await run_extraction(update, chat_id, user_id, text, notify_empty=True)
     logger.info(f"[user {user_id}] 📥 import extract: extracted={extracted} extract_cost=${cost:.4f}")
 
@@ -1280,6 +1360,68 @@ async def run_extraction(update, chat_id: int, user_id: int, text: str, notify_e
         return 0, cost
 
 
+SUMMARY_SYSTEM = (
+    "Тебе дан текст сцены. Напиши выжимку до 150 слов: кто участвует, где и когда, что произошло, "
+    "как изменились отношения и состояние героев, какие линии остались открытыми. "
+    "Нейтральные формулировки, без откровенных подробностей. "
+    "Не выдумывай ничего, чего нет в тексте. Ответ: только текст выжимки, без заголовков и пояснений."
+)
+
+
+async def make_summary(chat_id: int, text: str):
+    """Выжимка сцены одним вызовом SUMMARY_MODEL. Возвращает (статус, текст, стоимость $):
+    "ok", "skipped" (исчерпан дневной лимит) или "failed" (вызов упал, ответ обрезан или
+    пуст). Никогда не бросает. Стоимость идёт в /cost и в дневной лимит."""
+    cost = 0.0
+    try:
+        if over_daily_limit(chat_id):
+            logger.warning(f"{_tag(chat_id)} 🛑 summary skipped: daily limit reached")
+            return "skipped", None, cost
+        resp = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model=SUMMARY_MODEL,
+                max_tokens=SUMMARY_MAX_TOKENS,
+                system=SUMMARY_SYSTEM,
+                messages=[{"role": "user", "content": text[:SUMMARY_MAX_INPUT_CHARS]}],
+            )
+        )
+        add_usage(chat_id, SUMMARY_MODEL, resp.usage)
+        cost = cost_for_model(SUMMARY_MODEL, usage_bucket(resp.usage))
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            logger.warning(f"{_tag(chat_id)} summary: ответ обрезан (max_tokens={SUMMARY_MAX_TOKENS})")
+            return "failed", None, cost
+        summary = response_text(resp).strip()
+        if not summary:
+            logger.warning(f"{_tag(chat_id)} summary: пустой ответ")
+            return "failed", None, cost
+        return "ok", summary[:SUMMARY_MAX_CHARS], cost
+    except Exception as e:
+        logger.warning(f"{_tag(chat_id)} summary failed: {e!r}")
+        return "failed", None, cost
+
+
+async def summarize_saved_scene(update, chat_id: int, user_id: int, number: int, created: bool, text: str):
+    """Выжимка для только что сохранённой сцены (или для дубля, у которого её ещё нет).
+    Сцена к этому моменту уже сохранена: любой сбой это строка «выжимка не получилась» и
+    warning, сохранение не страдает. Лимит исчерпан: молча (warning)."""
+    try:
+        if not created:
+            info = rag.get_scene_summary(user_id, number)
+            if info is None or info[2]:
+                return  # сцены нет или выжимка уже есть
+        status, summary, cost = await make_summary(chat_id, text)
+        if status == "skipped":
+            return
+        if status == "ok":
+            if rag.set_summary(user_id, number, summary):
+                logger.info(f"[user {user_id}] 📖 summary scene {number}: ok, {len(summary)} chars, ${cost:.4f}")
+                return
+            logger.warning(f"[user {user_id}] summary: сцена {number} не найдена при записи")
+    except Exception as e:
+        logger.warning(f"[user {user_id}] summary: запись не удалась: {e!r}")
+    await update.message.reply_text("выжимка не получилась")
+
+
 def _fact_numbers(first: int, k: int) -> str:
     return f"№ {first}" if k == 1 else f"№ {first}-{first + k - 1}"
 
@@ -1346,10 +1488,22 @@ def context_report(user_id: int, chat_id: int) -> str:
         facts_line = f"{sum(1 for f in raw if is_pinned(f))} закреплённых + поиск до {RAG_MAX_FACTS} из {total}"
     on = scenes_enabled(user_id)
     try:
-        saved = str(len(rag.list_scenes(user_id)))
+        rows = rag.list_scenes(user_id)
+        items = rag.story_chronicle(user_id)
+        saved = str(len(rows))
+        story_line = (
+            f"хроника сюжета: {len(items)} сцен, {sum(len(s) for _, s in items)} симв.; "
+            f"без выжимки: {len(rows) - len(items)}"
+        )
+        used = len(select_chronicle(items)[0])
+        if on and used < len(items):
+            story_line += f"; в запрос войдут последние {used}"
+        if not on:
+            story_line += " (не подмешивается: память сцен выкл)"
     except Exception:
-        saved = "н/д"
-    scenes_line = ("вкл (до %d фрагментов, справкой ниже канона)" % SCENE_TOP_K if on else "выкл") + f", сохранено сцен: {saved}"
+        saved, story_line = "н/д", "хроника сюжета: н/д"
+    scenes_line = ("вкл" if on else "выкл") + f", сохранено сцен: {saved}"
+    fragments_line = f"до {SCENE_TOP_K}" if SCENE_TOP_K >= 1 else "выкл (SCENE_TOP_K=0)"
     mode = load_mode(chat_id)
     mode_line = "auto (роутер)" if mode == "auto" else f"{mode} ({MODELS[mode]})"
     lines = [
@@ -1357,6 +1511,8 @@ def context_report(user_id: int, chat_id: int) -> str:
         f"system-промпт: {len(load_prompt(chat_id))} симв.",
         f"факты: {facts_line}",
         f"память сцен: {scenes_line}",
+        story_line,
+        f"фрагменты сцен: {fragments_line}",
         f"режим модели: {mode_line}",
         f"извлечение фактов из сцен: {'вкл' if EXTRACT_ENABLED else 'выкл'}",
         limit_line(chat_id),
@@ -1375,8 +1531,9 @@ async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) == 2 and args[0] == "scenes" and args[1] in ("on", "off"):
             set_scenes_enabled(user_id, args[1] == "on")
             await update.message.reply_text(
-                f"✓ память сцен включена: к запросам подмешивается до {SCENE_TOP_K} фрагментов "
-                "сохранённых сцен справкой ниже канона."
+                "✓ память сцен включена: в запрос после канона идёт хроника сюжета (выжимки "
+                "сохранённых сцен по порядку)."
+                + (f" Фрагменты сцен: до {SCENE_TOP_K}." if SCENE_TOP_K >= 1 else "")
                 if args[1] == "on"
                 else "✓ память сцен выключена: в запрос идут только промпт и факты."
             )
@@ -1503,6 +1660,8 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     canon = build_canon_block(facts)
     fragments = get_memory_scenes(user_id, history)
     scenes_block = build_scenes_block(fragments)
+    story_items = get_story(user_id)
+    story_block = build_story_block(story_items)
     model = model_override or load_model(chat_id)
     facts_chars = len(canon)
 
@@ -1526,7 +1685,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             model=model,
             max_tokens=MAX_TOKENS,
             system=system_block(base_prompt),
-            messages=build_messages(history, canon, scenes_block),
+            messages=build_messages(history, canon, scenes_block, story_block),
         ) as stream:
             final = stream.get_final_message()
         assistant_text = response_text(final)
@@ -1570,6 +1729,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             f"{alias}: {_fmt_tokens(u['input'])} in / {_fmt_tokens(u['output'])} out / "
             f"cache r {u['cache_read']} w {u['cache_write']} | "
             f"${req_cost:.2f} | scenes={len(fragments)} | "
+            f"story={len(select_chronicle(story_items)[0]) if story_block else 0} | "
             f"extracted={extracted} extract_cost=${extract_cost:.4f}"
         )
     except anthropic.APIError as e:
