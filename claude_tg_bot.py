@@ -33,7 +33,8 @@ load_dotenv()
 
 import anthropic
 import rag
-from tg_logger import send_log
+from tg_logger import alert_error, alert_warn, exc_where, send_alert
+from ops_transient import TransientTracker, is_transient
 from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
@@ -816,7 +817,7 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         number, created = rag.save_scene(user_id, request, text)
     except Exception as e:
         logger.warning(f"[user {user_id}] /keep: сохранить не удалось: {e!r}")
-        await send_log(f"⚠️ klgpff /keep failed: {e!r}")
+        await alert_warn("/keep: сохранить не удалось", e)
         await update.message.reply_text(
             "не удалось сохранить: БД или Voyage недоступны. попробуй позже."
         )
@@ -1014,9 +1015,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
     # get_relevant_facts() гасит исключение БД внутри (sync, без await) и
     # сообщает о деградации через fact_source — логируем её здесь, в async-точке.
     if "vector DB unavailable" in fact_source:
-        await send_log(
-            f"⚠️ klgpff RAG fallback: vector DB unavailable ({len(facts)} facts used)"
-        )
+        await alert_warn("RAG fallback: vector DB unavailable", body=f"использовано фактов: {len(facts)}")
     logger.info(
         f"{tag} 🧠 prompt: system {len(base_prompt)} chars + canon {facts_chars} chars, "
         f"history {len(history)} msgs"
@@ -1045,10 +1044,7 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
             logger.warning(
                 f"{tag} ⚠️ empty response: stop_reason={final.stop_reason}, usage={u}"
             )
-            await send_log(
-                f"⚠️ klgpff empty response: stop_reason={final.stop_reason} "
-                f"usage={u} model={model}"
-            )
+            await alert_warn("empty response", body=f"stop_reason={final.stop_reason} · model={model} · usage={u}")
             await update.message.reply_text(
                 f"пустой ответ (stop_reason={final.stop_reason})"
             )
@@ -1077,11 +1073,11 @@ async def _generate_and_reply(update, chat_id, user_id, history, model_override=
         )
     except anthropic.APIError as e:
         logger.error(f"{tag} ❌ Anthropic API error: {e}")
-        await send_log(f"🔴 klgpff generate API error: {e!r}")
+        await alert_error("generate: ошибка API", e)
         await update.message.reply_text(f"ошибка API: {e.message}")
     except Exception as e:
         logger.error(f"{tag} ❌ error: {e}")
-        await send_log(f"🔴 klgpff generate error: {e!r}")
+        await alert_error("generate: ошибка", e)
         await update.message.reply_text(f"ошибка: {str(e)}")
 
 
@@ -1099,7 +1095,7 @@ CLASSIFIER_PROMPT = (
 async def classify_message(chat_id: int, user_text: str) -> str:
     """Returns 'opus' | 'sonnet' | 'haiku'. Defaults to 'sonnet' on any error
     and when the reply is empty or names none of the three.
-    async только ради await send_log в фолбэке; сам вызов client остаётся
+    async только ради await alert_warn в фолбэке; сам вызов client остаётся
     синхронным, как и в остальном коде."""
     try:
         response = client.messages.create(
@@ -1115,7 +1111,7 @@ async def classify_message(chat_id: int, user_text: str) -> str:
                 return alias
     except Exception as e:
         logger.warning(f"classify_message fallback to sonnet: {e}")
-        await send_log(f"⚠️ klgpff classifier fallback→sonnet: {e!r}")
+        await alert_warn("classifier fallback → sonnet", e)
     return "sonnet"
 
 
@@ -1133,7 +1129,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_text = file_bytes.decode("utf-8", errors="replace")
     except Exception as e:
         logger.error(f"document read error: {e}")
-        await send_log(f"🔴 klgpff document read error: {e!r}")
+        await alert_error("document read error", e)
         await update.message.reply_text(f"не смогла прочитать файл: {e}")
         return
 
@@ -1218,6 +1214,7 @@ def split_by_paragraphs(text: str, limit: int = 4096) -> list[str]:
 
 
 HEARTBEAT_PATH = "/tmp/heartbeat"
+transient = TransientTracker()   # счётчик сетевых сбоев Telegram: /tmp/ops_transient.json
 HEARTBEAT_INTERVAL = 30
 
 
@@ -1231,22 +1228,37 @@ async def heartbeat_loop():
             Path(HEARTBEAT_PATH).write_text(str(int(time.time())), encoding="utf-8")
         except Exception as e:
             logger.warning(f"heartbeat write failed: {e}")
+        try:                                       # «восстановлено» после тихих минут
+            action = transient.tick()
+            if action:
+                await send_alert(*action)
+        except Exception as e:
+            logger.warning(f"transient tick failed: {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 async def register_commands(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
-    await send_log("🚀 klgpff поднялся")
     # PTB-tracked task: держит strong-ref (без GC-гонки голого create_task) и
     # отменяется при shutdown'е приложения.
     app.create_task(heartbeat_loop())
 
 
 async def error_handler(update, context):
-    """Глобальный хук PTB: ловит ИСКЛЮЧЕНИЯ, не пойманные в хендлерах.
-    Локальные try/except (generate/summary/classifier) гасят свои ошибки и
-    логируют сами — сюда они не доходят, дублей нет. Шлём тип+текст, не трейс."""
-    await send_log(f"🔴 klgpff error: {context.error!r}")
+    """Глобальный хук PTB: ловит ИСКЛЮЧЕНИЯ, не пойманные в хендлерах, и обрывы long polling.
+    Локальные try/except (generate/summary/classifier) гасят свои ошибки и логируют сами:
+    сюда они не доходят, дублей нет. Сетевые сбои Telegram только считаются (ops_transient),
+    алерт один на всплеск. Остальное: класс исключения и место в коде, без текста и без трейса
+    (полный текст в docker logs)."""
+    err = context.error
+    if is_transient(err):
+        logger.warning(f"transient telegram/network error: {err!r}")
+        action = transient.record(err)
+        if action:
+            await send_alert(*action)
+        return
+    logger.error(f"unhandled error: {err!r}")
+    await alert_error("необработанная ошибка", err, exc_where(err))
 
 
 def main():

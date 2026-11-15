@@ -19,3 +19,24 @@ jobs:
             git pull
             docker compose up -d --build klgpff-bot
             docker compose ps
+
+      # Ops-group messages through the shared action (heylark-infra): the topic (klgpff) comes from
+      # heylark-infra/ops/topics.env. The action never fails this job; a Telegram problem shows up
+      # as a ::warning::.
+      - name: Notify (deploy ok)
+        uses: dontkaiad/heylark-infra/.github/actions/ops-notify@ops-v1
+        with:
+          project: klgpff
+          kind: deploy_ok
+          token: ${{ secrets.TG_LOG_BOT_TOKEN }}
+          chat-id: ${{ secrets.TG_LOG_CHAT_ID }}
+
+      - name: Notify (deploy failed)
+        if: failure()
+        uses: dontkaiad/heylark-infra/.github/actions/ops-notify@ops-v1
+        with:
+          project: klgpff
+          kind: deploy_fail
+          title: Deploy over SSH
+          token: ${{ secrets.TG_LOG_BOT_TOKEN }}
+          chat-id: ${{ secrets.TG_LOG_CHAT_ID }}

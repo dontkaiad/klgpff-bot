@@ -300,7 +300,9 @@ class CommandBase(unittest.TestCase):
             mock.patch.object(bot.rag, "save_scene", side_effect=self.store.save_scene),
             mock.patch.object(bot.rag, "list_scenes", side_effect=self.store.list_scenes),
             mock.patch.object(bot.rag, "delete_scene", side_effect=self.store.delete_scene),
-            mock.patch.object(bot, "send_log", new=mock.AsyncMock()),
+            mock.patch.object(bot, "alert_error", new=mock.AsyncMock()),
+            mock.patch.object(bot, "alert_warn", new=mock.AsyncMock()),
+            mock.patch.object(bot, "send_alert", new=mock.AsyncMock()),
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -563,7 +565,9 @@ class GenerateTests(unittest.TestCase):
             mock.patch.object(bot.rag, "search_scenes", self.search),
             mock.patch.object(bot, "add_usage"),
             mock.patch.object(bot, "load_prompt", return_value="системный промпт"),
-            mock.patch.object(bot, "send_log", new=mock.AsyncMock()),
+            mock.patch.object(bot, "alert_error", new=mock.AsyncMock()),
+            mock.patch.object(bot, "alert_warn", new=mock.AsyncMock()),
+            mock.patch.object(bot, "send_alert", new=mock.AsyncMock()),
             mock.patch.object(bot, "SCENE_TOP_K", 3),
         ):
             p.start()
