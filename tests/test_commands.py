@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import claude_tg_bot as bot  # noqa: E402
 
-KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget", "facts", "keep", "scenes", "unkeep", "import", "done", "cancel", "accept", "context", "extract"}
+KEPT = {"start", "help", "new", "model", "regenerate", "scene", "addprompt", "cost", "remember", "forget", "facts", "keep", "scenes", "unkeep", "import", "done", "cancel", "prompt", "go", "accept", "context", "extract"}
 REMOVED = {"system", "summarize", "setsystem"}
 
 

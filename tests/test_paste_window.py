@@ -11,8 +11,8 @@ from support import Base2, at, bot, origin_from
 from test_import_limit import BOT_ID, OUTSIDER
 
 LONG = "а" * (bot.MAX_INPUT_CHARS + 1)
-LONG_NOTICE = "длинный текст не отправлен в модель"
-PASTE_NOTICE = "несколько сообщений подряд не отправлены в модель"
+LONG_NOTICE = "длинный текст не отправлен; для длинного запроса: /prompt, части (или .txt), /go. Для сохранения сцены: /import, части, /done"
+PASTE_NOTICE = "несколько сообщений подряд не отправлены; для длинного запроса: /prompt, части (или .txt), /go"
 WINDOW = bot.PASTE_WINDOW_SECONDS
 
 
@@ -156,8 +156,9 @@ class FastBurstTests(PasteBase):
         self.assertNotIn(LONG_NOTICE, self.msg("второе", 1000)[0])
 
     def test_incident_shape_fourteen_long_parts_and_a_tail(self):
-        """20:48 МСК: 14 кусков по ~4000 символов и хвост короче порога в одну секунду."""
-        replies = [self.msg("б" * 4000, 1000) for _ in range(14)] + [self.msg("хвост сцены " * 100, 1001)]
+        """20:48 МСК: 14 кусков по 4096 символов (так Telegram режет вставку) и хвост короче
+        порога в одну секунду."""
+        replies = [self.msg("б" * 4096, 1000) for _ in range(14)] + [self.msg("хвост сцены " * 100, 1001)]
         self.assertEqual(sum(len(r) for r in replies), 1)
         self.assertEqual(self.client.mock_calls, [])
 

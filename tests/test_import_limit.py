@@ -170,7 +170,7 @@ class ForwardImportTests(Base):
         self.assertEqual(self.store.scenes[111][0]["text"], "часть A\n\nчасть B\n\nчасть C")
 
     def test_long_forwarded_part_is_accepted_not_blocked_by_length_guard(self):
-        long_part = paragraph(0, 900)  # > 3500 символов
+        long_part = paragraph(0, 900)  # > MAX_INPUT_CHARS
         self.assertGreater(len(long_part), bot.MAX_INPUT_CHARS)
         self.assertEqual(self.forward(111, long_part, 10), ["часть 1 принята"])
 
@@ -429,8 +429,8 @@ class InputSizeTests(Base):
         self.assert_model_untouched()
         self.assertEqual(
             out,
-            ["длинный текст не отправлен в модель, чтобы не тратить деньги; "
-             "для сохранения сцены: /import, части (или .txt), /done"],
+            ["длинный текст не отправлен; для длинного запроса: /prompt, части (или .txt), /go. "
+             "Для сохранения сцены: /import, части, /done"],
         )
         self.assertNotIn(text[:50], "\n".join(cm.output))  # текст в лог не пишется
         self.assertEqual(bot.conversations, {})
@@ -439,8 +439,8 @@ class InputSizeTests(Base):
         self.say(111, "а" * bot.MAX_INPUT_CHARS)
         self.client.messages.stream.assert_called_once()
 
-    def test_threshold_is_3500(self):
-        self.assertEqual(bot.MAX_INPUT_CHARS, 3500)
+    def test_threshold_is_4000(self):
+        self.assertEqual(bot.MAX_INPUT_CHARS, 4000)
 
     def test_outsider_long_message_gets_silence(self):
         self.assertEqual(self.say(OUTSIDER, "а" * 5000), [])

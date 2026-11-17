@@ -86,12 +86,19 @@ AUX_THINKING = os.environ.get("AUX_THINKING", "disabled").strip().lower()
 DAILY_LIMIT_USD = float(os.environ.get("DAILY_LIMIT_USD", "2.00"))
 # Обычное сообщение (не команда) длиннее этого в модель не уходит: длинный текст
 # это обычно сцена, вставленная частями, и каждая часть стоила бы запроса Opus.
-MAX_INPUT_CHARS = 3500
+# Потолок одного сообщения Telegram 4096; длинный запрос идёт через /prompt и /go.
+MAX_INPUT_CHARS = 4000
 # Части сцены, пересланные боту от него самого: сколько хранить без новых частей.
 FORWARD_BUFFER_TTL = 30 * 60
 # Режим /import и буфер частей: потолок буфера в символах и размер принимаемого файла.
 IMPORT_BUFFER_MAX_CHARS = 60000
 IMPORT_DOC_MAX_BYTES = 200 * 1024
+# Режим /prompt: длинный запрос на генерацию (пересказ) собирается в буфер и уходит в модель
+# одним запросом по /go. Потолок буфера в символах (с разделителями между частями); оценка
+# стоимости до отправки: символов на токен для русского текста и вилка токенов ответа.
+PROMPT_BUFFER_MAX_CHARS = 20000
+PROMPT_CHARS_PER_TOKEN = 2.8
+PROMPT_OUT_TOKENS = (5000, 10000)
 # Извлечение кандидатов в факты (extract.py): после /done и после каждой сцены,
 # которую написал бот (ответ от EXTRACT_MIN_WORDS слов). В факты попадает только по /accept.
 EXTRACT_ENABLED = os.environ.get("EXTRACT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
@@ -765,10 +772,13 @@ HELP_TEXT = (
     "/forget <номер> — забыть по номеру\n"
     "/forget all — забыть всё\n"
     "/facts — все факты с номерами для /forget\n\n"
+    "📤 длинный запрос (пересказ до 20000 символов, одним запросом):\n"
+    "/prompt — режим сбора: присылай части или .txt/.md файл, модель не вызывается\n"
+    "/go — отправить собранное в модель (сначала символы и примерная цена); /cancel отменит\n\n"
     "📥 загрузка текста (без модели, без расходов):\n"
     "/import — режим приёма: присылай части, пересылки или .txt/.md файл\n"
     "/done — сохранить принятое как сцену и найти кандидатов в факты\n"
-    "/cancel — выйти из режима без сохранения\n"
+    "/cancel — выйти из режима /import или /prompt без сохранения\n"
     "/accept <номера|all> — принять кандидатов в факты\n"
     "/extract <номер> — повторить поиск кандидатов в факты для сохранённой сцены\n\n"
     "🎬 память сцен (только вручную, по умолчанию не подмешивается):\n"
@@ -795,9 +805,11 @@ BOT_COMMANDS = [
     ("keep", "сохранить сцену в память (ответом на сообщение бота)"),
     ("scenes", "сохранённые сцены; /scenes N: выжимка"),
     ("unkeep", "удалить сохранённую сцену по номеру"),
+    ("prompt", "длинный запрос: части или .txt, в конце /go"),
+    ("go", "отправить собранный длинный запрос в модель"),
     ("import", "режим приёма: части сцены или .txt, в конце /done"),
     ("done", "сохранить принятый текст как сцену"),
-    ("cancel", "выйти из режима /import без сохранения"),
+    ("cancel", "выйти из режима /import или /prompt"),
     ("accept", "принять кандидатов в факты: номера или all"),
     ("extract", "повторить поиск кандидатов в факты для сцены N"),
     ("context", "что уйдёт в модель; scenes on|off"),
@@ -933,9 +945,10 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # буфер (в памяти процесса, свой на пользователя), /keep без ответа сохраняет
 # склеенную сцену. Буфер живёт FORWARD_BUFFER_TTL без новых частей, сбрасывается
 # по /new и после сохранения.
-forward_buffers: dict = {}  # user_id -> {"parts": [(дата, seq, текст)], "hashes", "seq", "chars", "last", "import"}
-# user_id, у которых режим /import погас по таймауту, а юзер ещё не уведомлён.
+forward_buffers: dict = {}  # user_id -> {"parts": [(дата, seq, текст)], "hashes", "seq", "chars", "last", "import", "prompt"}
+# user_id, у которых режим /import или /prompt погас по таймауту, а юзер ещё не уведомлён.
 import_expired: set = set()
+prompt_expired: set = set()
 
 
 def _now() -> float:
@@ -948,10 +961,13 @@ def _live_buffer(user_id: int, create: bool = False):
         forward_buffers.pop(user_id)
         if b.get("import"):
             import_expired.add(user_id)
+        if b.get("prompt"):
+            prompt_expired.add(user_id)
         b = None
     if b is None and create:
         b = forward_buffers[user_id] = {
-            "parts": [], "hashes": set(), "seq": 0, "chars": 0, "last": _now(), "import": False,
+            "parts": [], "hashes": set(), "seq": 0, "chars": 0, "last": _now(),
+            "import": False, "prompt": False,
         }
     return b
 
@@ -961,23 +977,39 @@ def import_active(user_id: int) -> bool:
     return bool(b and b["import"])
 
 
+def prompt_active(user_id: int) -> bool:
+    b = _live_buffer(user_id)
+    return bool(b and b["prompt"])
+
+
+def collect_mode(user_id: int):
+    """"import", "prompt" или None: режим, в котором входящий текст идёт в буфер без модели."""
+    b = _live_buffer(user_id)
+    if not b:
+        return None
+    return "import" if b["import"] else "prompt" if b["prompt"] else None
+
+
 def clear_import(user_id: int):
-    """Выход из режима /import и очистка буфера (по /new, /cancel, /done, /keep)."""
+    """Выход из режима /import или /prompt и очистка буфера (по /new, /cancel, /done, /go, /keep)."""
     forward_buffers.pop(user_id, None)
     import_expired.discard(user_id)
+    prompt_expired.discard(user_id)
 
 
 async def notify_import_expired(update, user_id: int) -> bool:
-    """Если режим /import погас по таймауту, сообщает об этом один раз и возвращает
-    True: текущее сообщение не обрабатывается (иначе часть фанфика ушла бы в модель)."""
-    if user_id not in import_expired:
-        return False
-    import_expired.discard(user_id)
-    await update.message.reply_text(
-        "режим /import выключен: 30 минут без новых частей, буфер очищен. "
-        "это сообщение не обработано; начни заново: /import"
-    )
-    return True
+    """Если режим /import или /prompt погас по таймауту, сообщает об этом один раз и
+    возвращает True: текущее сообщение не обрабатывается (иначе часть фанфика или
+    запроса ушла бы в модель)."""
+    for expired, name in ((import_expired, "/import"), (prompt_expired, "/prompt")):
+        if user_id in expired:
+            expired.discard(user_id)
+            await update.message.reply_text(
+                f"режим {name} выключен: 30 минут без новых частей, буфер очищен. "
+                f"это сообщение не обработано; начни заново: {name}"
+            )
+            return True
+    return False
 
 
 def forwarded_from_bot(msg, bot_id: int):
@@ -1000,18 +1032,22 @@ def forwarded_from_bot(msg, bot_id: int):
 
 def add_part(user_id: int, ts: float, text: str):
     """Кладёт часть в буфер. Возвращает (число частей, статус): "new", "dup" (тот же
-    текст уже есть) или "full" (не помещается в IMPORT_BUFFER_MAX_CHARS)."""
+    текст уже есть) или "full" (не помещается в потолок: PROMPT_BUFFER_MAX_CHARS в режиме
+    /prompt, иначе IMPORT_BUFFER_MAX_CHARS). Потолок считается по склеенному тексту,
+    с пустой строкой между частями."""
     b = _live_buffer(user_id, create=True)
     b["last"] = _now()
     text = text.strip()
     h = rag.scene_hash(text)
     if h in b["hashes"]:
         return len(b["parts"]), "dup"
-    if b["chars"] + len(text) > IMPORT_BUFFER_MAX_CHARS:
+    limit = PROMPT_BUFFER_MAX_CHARS if b["prompt"] else IMPORT_BUFFER_MAX_CHARS
+    added = len(text) + (2 if b["parts"] else 0)
+    if b["chars"] + added > limit:
         return len(b["parts"]), "full"
     b["hashes"].add(h)
     b["seq"] += 1
-    b["chars"] += len(text)
+    b["chars"] += added
     b["parts"].append((ts, b["seq"], text))
     return len(b["parts"]), "new"
 
@@ -1025,14 +1061,23 @@ def buffered_parts(user_id: int) -> list:
     return [t for _, _, t in sorted(b["parts"], key=lambda x: (x[0], x[1]))]
 
 
-async def accept_part(update, user_id: int, ts: float, text: str, import_mode: bool):
-    """Часть в буфер и короткий ответ без модели."""
+async def accept_part(update, user_id: int, ts: float, text: str, mode):
+    """Часть в буфер и короткий ответ без модели. mode: "import", "prompt" или None
+    (пересылка от бота вне режимов)."""
     n, status = add_part(user_id, ts, text)
-    logger.info(f"[user {user_id}] 📥 part {status}, {n} in buffer" + (" (import)" if import_mode else ""))
-    if status == "new":
-        reply = f"часть {n}, {len(text.split())} слов" if import_mode else f"часть {n} принята"
+    logger.info(f"[user {user_id}] 📥 part {status}, {n} in buffer" + (f" ({mode})" if mode else ""))
+    if status == "new" and mode == "prompt":
+        used = forward_buffers[user_id]["chars"]
+        reply = f"часть {n}, {len(text.strip())} символов (в буфере {used} из {PROMPT_BUFFER_MAX_CHARS})"
+    elif status == "new":
+        reply = f"часть {n}, {len(text.split())} слов" if mode == "import" else f"часть {n} принята"
     elif status == "dup":
         reply = f"эта часть уже принята (всего {n})"
+    elif mode == "prompt":
+        reply = (
+            f"буфер запроса ограничен {PROMPT_BUFFER_MAX_CHARS} символов, эта часть не принята. "
+            "/go отправит накопленное, /cancel сбросит"
+        )
     else:
         reply = (
             f"буфер ограничен {IMPORT_BUFFER_MAX_CHARS} символов, эта часть не принята и дальше не принимаю. "
@@ -1091,6 +1136,9 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n_parts = 0
     if replied is None and import_active(user_id):
         await update.message.reply_text("идёт режим /import: заверши командой /done (или /cancel).")
+        return
+    if replied is None and prompt_active(user_id):
+        await update.message.reply_text("идёт режим /prompt: отправь запрос командой /go (или /cancel).")
         return
     if replied is None:
         parts = buffered_parts(user_id)
@@ -1234,6 +1282,9 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     user_id = update.effective_user.id
+    if prompt_active(user_id):
+        await update.message.reply_text("идёт режим /prompt: отправь запрос командой /go (или /cancel).")
+        return
     b = _live_buffer(user_id, create=True)  # просроченный буфер заменяется новым
     import_expired.discard(user_id)  # новый /import: старое уведомление о таймауте не нужно
     b["import"] = True
@@ -1254,7 +1305,10 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await notify_import_expired(update, user_id):
         return
     if not active:
-        await update.message.reply_text("режим /import не включён. начни с /import")
+        if prompt_active(user_id):
+            await update.message.reply_text("идёт режим /prompt: отправь запрос командой /go (или /cancel).")
+        else:
+            await update.message.reply_text("режим /import не включён. начни с /import")
         return
     parts = buffered_parts(user_id)
     if not parts:
@@ -1291,16 +1345,102 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     user_id = update.effective_user.id
-    active = import_active(user_id)
+    mode = collect_mode(user_id)
     if await notify_import_expired(update, user_id):
         return
     b = forward_buffers.get(user_id)
     k = len(b["parts"]) if b else 0
-    if not active and not k:
+    if not mode and not k:
         await update.message.reply_text("нечего отменять.")
         return
     clear_import(user_id)
+    if mode == "prompt":
+        await update.message.reply_text(f"запрос отменён, буфер очищен (частей: {k}). в модель ничего не ушло.")
+        return
     await update.message.reply_text(f"импорт отменён, буфер очищен (частей: {k}). ничего не сохранено.")
+
+
+# --- Режим /prompt: длинный запрос одним сообщением в модель ---
+async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Режим сбора длинного запроса (пересказ до PROMPT_BUFFER_MAX_CHARS символов): тексты,
+    пересылки и .txt/.md идут в буфер, модель не зовётся. /go отправляет одним запросом."""
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    if import_active(user_id):
+        await update.message.reply_text("идёт режим /import: заверши командой /done (или /cancel).")
+        return
+    b = _live_buffer(user_id)
+    if b and b["parts"] and not b["prompt"]:
+        # В буфере пересланные боту части сцены для /keep: подмешивать их в запрос нельзя,
+        # а молча стирать нельзя тем более.
+        await update.message.reply_text(
+            f"в буфере уже есть пересланные части сцены (частей: {len(b['parts'])}). "
+            "сохрани их командой /keep или сбрось командой /cancel, потом /prompt"
+        )
+        return
+    b = _live_buffer(user_id, create=True)  # просроченный буфер заменяется новым
+    prompt_expired.discard(user_id)
+    b["prompt"] = True
+    b["last"] = _now()
+    n = len(b["parts"])
+    await update.message.reply_text(
+        f"присылай части запроса или .txt/.md файл (до {PROMPT_BUFFER_MAX_CHARS} символов), "
+        "в конце /go; /cancel отменит"
+        + (f"\n(в буфере уже частей: {n})" if n else "")
+    )
+
+
+def estimate_prompt_cost(chars: int, alias: str) -> tuple:
+    """(нижняя, верхняя) оценка в долларах: запрос без кэша плюс ответ в вилке
+    PROMPT_OUT_TOKENS. Канон, хроника и история сюда не входят."""
+    price = PRICING[alias]
+    tokens_in = chars / PROMPT_CHARS_PER_TOKEN
+    lo, hi = (tokens_in * price["in"] + t * price["out"] for t in PROMPT_OUT_TOKENS)
+    return lo / 1_000_000, hi / 1_000_000
+
+
+async def cmd_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Склеивает буфер /prompt в один запрос и отправляет его в обычный пайплайн генерации.
+    Порядок: режим включён, буфер не пуст, дневной лимит, строка с символами и оценкой,
+    затем генерация. Если ответа не получилось, буфер возвращается, а запрос убирается из истории."""
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    active = prompt_active(user_id)
+    if await notify_import_expired(update, user_id):
+        return
+    if not active:
+        await update.message.reply_text("режим /prompt не включён. начни с /prompt")
+        return
+    parts = buffered_parts(user_id)
+    if not parts:
+        await update.message.reply_text("буфер пуст: пришли текст запроса (или .txt) и снова /go")
+        return
+    if await block_if_over_limit(update, chat_id):
+        return  # буфер цел: после смены лимита или на следующий день /go повторяется
+    text = "\n\n".join(parts)
+    mode = load_mode(chat_id)
+    alias = "opus" if mode == "auto" else mode
+    lo, hi = estimate_prompt_cost(len(text), alias)
+    scope = alias if mode != "auto" else "opus, при auto роутер может выбрать дешевле"
+    await update.message.reply_text(
+        f"{len(text)} символов в одном запросе, ≈ ${lo:.2f}–{hi:.2f} ({scope}), "
+        "без канона и хроники. генерирую..."
+    )
+    buf = forward_buffers[user_id]
+    clear_import(user_id)  # режим выключен до вызова модели: второй /go не отправит запрос повторно
+    logger.info(f"[user {user_id}] 📤 /go: {len(parts)} parts, {len(text)} chars in one request")
+    await _process_user_text(update, text, log_text=False)
+    history = conversations.get(chat_id) or []
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == text:
+        # Ответа нет (ошибка API, пустой ответ): запрос не должен остаться в истории,
+        # а набранный на 20 тысяч символов текст не должен пропасть.
+        conversations[chat_id] = history[:-1]
+        buf["last"] = _now()
+        forward_buffers[user_id] = buf
+        await update.message.reply_text("ответа нет, запрос сохранён в буфере: повтори /go")
 
 
 def aux_call_kwargs() -> dict:
@@ -1597,6 +1737,8 @@ def context_report(user_id: int, chat_id: int) -> str:
     ]
     if import_active(user_id):
         lines.append("режим /import: идёт (запросы к модели не уходят)")
+    if prompt_active(user_id):
+        lines.append("режим /prompt: идёт (в модель уйдёт одним запросом по /go)")
     return "\n".join(lines)
 
 
@@ -1855,7 +1997,7 @@ async def classify_message(chat_id: int, user_text: str) -> str:
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Документы никогда не идут в модель. В режиме /import .txt и .md (UTF-8, до
+    """Документы никогда не идут в модель. В режиме /import или /prompt .txt и .md (UTF-8, до
     200 КБ) становятся частью буфера; вне режима файл не принимается (раньше .txt
     уходил прямо в Opus, мимо порога длины)."""
     if not is_allowed(update.effective_user.id):
@@ -1864,19 +2006,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     name = ((doc.file_name if doc else "") or "").lower()
     is_text_doc = name.endswith((".txt", ".md"))
-    active = import_active(user_id)
+    mode = collect_mode(user_id)
     if await notify_import_expired(update, user_id):
         return
-    if not active:
+    if not mode:
         if is_text_doc:
-            logger.info(f"[user {user_id}] 📄 document outside /import: not sent to model")
+            logger.info(f"[user {user_id}] 📄 document outside /import and /prompt: not sent to model")
             await update.message.reply_text(
                 "файл не отправлен в модель, чтобы не тратить деньги. "
-                "чтобы загрузить текст: /import, затем файл, затем /done"
+                "длинный запрос: /prompt, затем файл, затем /go. "
+                "сохранить сцену: /import, затем файл, затем /done"
             )
         return
     if not is_text_doc:
-        await update.message.reply_text("в режиме /import принимаю только .txt и .md")
+        await update.message.reply_text(f"в режиме /{mode} принимаю только .txt и .md")
         return
     if doc.file_size and doc.file_size > IMPORT_DOC_MAX_BYTES:
         await update.message.reply_text(
@@ -1903,13 +2046,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text.strip():
         await update.message.reply_text("файл пустой")
         return
-    await accept_part(update, user_id, update.message.date.timestamp(), text, True)
+    await accept_part(update, user_id, update.message.date.timestamp(), text, mode)
 
 
 # user_id -> {"until": конец окна (unix), "count": сколько сообщений отклонено, "last": дата
 # предыдущего обычного сообщения}. Время берётся из даты сообщения Telegram, а не из момента
 # обработки: пока бот ждёт ответ модели, очередь стоит, и по часам обработки окно бы не работало.
 paste_state: dict = {}
+
+
+LONG_TEXT_ROUTES = (
+    "для длинного запроса: /prompt, части (или .txt), /go. "
+    "Для сохранения сцены: /import, части, /done"
+)
+LONG_TEXT_HINT_LONG = f"длинный текст не отправлен; {LONG_TEXT_ROUTES}"
+LONG_TEXT_HINT_PASTE = f"несколько сообщений подряд не отправлены; {LONG_TEXT_ROUTES}"
 
 
 def paste_check(user_id: int, ts: float, too_long: bool) -> str:
@@ -1941,19 +2092,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    import_mode = import_active(user_id)
+    mode = collect_mode(user_id)
     if await notify_import_expired(update, user_id):
         return
     ts = forwarded_from_bot(update.message, context.bot.id)
-    if import_mode:
-        # Режим /import: любой текст (и пересылка) молча в буфер, модель не зовётся,
-        # порог MAX_INPUT_CHARS не действует.
+    if mode:
+        # Режим /import или /prompt: любой текст (и пересылка) молча в буфер, модель не
+        # зовётся, порог MAX_INPUT_CHARS не действует.
         when = ts if ts is not None else update.message.date.timestamp()
-        await accept_part(update, user_id, when, user_text, True)
+        await accept_part(update, user_id, when, user_text, mode)
         return
     if ts is not None:
         # Часть сцены, пересланная от самого бота: в модель не идёт, только буфер.
-        await accept_part(update, user_id, ts, user_text, False)
+        await accept_part(update, user_id, ts, user_text, None)
         return
 
     date = getattr(update.message, "date", None)
@@ -1972,26 +2123,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"[user {user_id}] long text not sent to model: {len(user_text)} chars > {MAX_INPUT_CHARS}; "
             f"paste window {PASTE_WINDOW_SECONDS:g}s opened"
         )
-        await update.message.reply_text(
-            "длинный текст не отправлен в модель, чтобы не тратить деньги; "
-            "для сохранения сцены: /import, части (или .txt), /done"
-        )
+        await update.message.reply_text(LONG_TEXT_HINT_LONG)
         return
     if verdict == "reject_paste":
         logger.warning(
             f"[user {user_id}] several messages in a row not sent to model; "
             f"paste window {PASTE_WINDOW_SECONDS:g}s opened"
         )
-        await update.message.reply_text(
-            "несколько сообщений подряд не отправлены в модель, чтобы не тратить деньги; "
-            "для сохранения сцены: /import, части (или .txt), /done"
-        )
+        await update.message.reply_text(LONG_TEXT_HINT_PASTE)
         return
 
     await _process_user_text(update, user_text)
 
 
-async def _process_user_text(update: Update, user_text: str):
+async def _process_user_text(update: Update, user_text: str, log_text: bool = True):
+    """log_text=False: в лог идёт только длина (длинный запрос по /go)."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     if await block_if_over_limit(update, chat_id):
@@ -2002,7 +2148,7 @@ async def _process_user_text(update: Update, user_text: str):
     conversations[chat_id] = history
 
     tag = _tag(chat_id)
-    logger.info(f'{tag} 📩 "{user_text[:80]}"')
+    logger.info(f'{tag} 📩 "{user_text[:80]}"' if log_text else f"{tag} 📩 long request, {len(user_text)} chars")
 
     mode = load_mode(chat_id)
     if mode == "auto":
@@ -2130,6 +2276,8 @@ def main():
     app.add_handler(CommandHandler("keep", cmd_keep))
     app.add_handler(CommandHandler("scenes", cmd_scenes))
     app.add_handler(CommandHandler("unkeep", cmd_unkeep))
+    app.add_handler(CommandHandler("prompt", cmd_prompt))
+    app.add_handler(CommandHandler("go", cmd_go))
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
